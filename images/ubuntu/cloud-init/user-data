@@ -1,0 +1,91 @@
+#cloud-config
+# Cloud-init config baked into /start.iso (NoCloud datasource).
+# Edit this file to customize what happens on first boot of the VM.
+# After rebuilding the Docker image, the new config takes effect on the
+# *next fresh start* (i.e. after deleting the storage volume) — cloud-init
+# only runs once per disk image.
+
+hostname: ubuntu-vm
+manage_etc_hosts: true
+preserve_hostname: false
+locale: en_US.UTF-8
+timezone: UTC
+
+# Allow password SSH login. Replace the password and/or add an SSH key
+# under `users` for production use.
+ssh_pwauth: true
+disable_root: false
+chpasswd:
+  expire: false
+  list: |
+    ubuntu:ubuntu
+    root:root
+
+users:
+  - name: ubuntu
+    gecos: Default User
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: sudo, adm
+    shell: /bin/bash
+    lock_passwd: false
+    # Uncomment and paste your public key to enable key-based SSH login.
+    # ssh_authorized_keys:
+    #   - ssh-ed25519 AAAA... user@host
+
+package_update: true
+package_upgrade: false
+packages:
+  - curl
+  - vim
+  - htop
+  - ca-certificates
+
+# Files written before runcmd executes.
+write_files:
+  - path: /opt/firstboot.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      # =====================================================================
+      # First-boot initialization script.
+      # Runs ONCE on first boot of the VM, after cloud-init basic setup.
+      # Edit freely — anything you put here will be executed.
+      # =====================================================================
+      set -euo pipefail
+
+      LOG=/var/log/firstboot.log
+      exec > >(tee -a "$LOG") 2>&1
+
+      echo "==> First boot starting at $(date -Is)"
+      echo "==> Hostname: $(hostname)"
+      echo "==> Kernel:   $(uname -r)"
+
+      # ---- put your initialization logic below ---------------------------
+
+      # Example: install Docker
+      # curl -fsSL https://get.docker.com | sh
+      # usermod -aG docker ubuntu
+
+      # Example: clone a repository and run a setup script
+      # git clone https://github.com/your-org/your-app.git /opt/your-app
+      # cd /opt/your-app && ./setup.sh
+
+      # Example: write a marker file so you can verify init ran
+      echo "Initialized at $(date -Is)" > /etc/firstboot.done
+
+      # --------------------------------------------------------------------
+
+      echo "==> First boot finished at $(date -Is)"
+
+# Commands run on first boot, after write_files.
+runcmd:
+  - [ /opt/firstboot.sh ]
+
+# Final message printed to console when cloud-init completes.
+final_message: |
+  ===============================================================
+   Cloud-init finished after $UPTIME seconds.
+   First-boot log: /var/log/firstboot.log
+   Default credentials: ubuntu / ubuntu
+  ===============================================================
