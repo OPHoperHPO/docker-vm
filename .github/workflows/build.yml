@@ -113,22 +113,25 @@ jobs:
           DEFAULT_WIN_VERSION: win11x64-enterprise-iot-eval
         run: |
           set -eu
-          BUILD_ARGS=""
+
+          # Build a list of KEY=VALUE pairs into a tmp file so we don't have
+          # to worry about how multiline strings interact with YAML indentation.
+          ARGS_FILE=$(mktemp)
+          echo "GITHUB_REPOSITORY=${{ github.repository }}" >> "$ARGS_FILE"
 
           if [ "${{ matrix.target }}" = "ubuntu" ]; then
             CODENAME="${{ github.event.inputs.ubuntu_codename }}"
             CODENAME="${CODENAME:-noble}"
-            BUILD_ARGS="UBUNTU_CODENAME=${CODENAME}"
+            echo "UBUNTU_CODENAME=${CODENAME}" >> "$ARGS_FILE"
           fi
 
           if [ "${{ matrix.target }}" = "windows" ]; then
             URL="${{ github.event.inputs.win_iso_url }}"
             SHA="${{ github.event.inputs.win_iso_sha256 }}"
 
-            # If the user supplied an explicit URL, use it as-is (must come
-            # with its SHA256). Otherwise, resolve from dockur/windows' upstream
-            # define.sh — the same source mido.sh uses at runtime, kept current
-            # by the dockur project whenever Microsoft rotates the ISO.
+            # If the user supplied an explicit URL, use it as-is. Otherwise,
+            # resolve from dockur/windows' upstream define.sh — kept current
+            # whenever Microsoft rotates an ISO.
             if [ -n "$URL" ]; then
               if [ -z "$SHA" ]; then
                 echo "::error::win_iso_sha256 must be set when win_iso_url is overridden" >&2
@@ -177,16 +180,18 @@ jobs:
               echo "Resolved SHA: $SHA"
             fi
 
-            BUILD_ARGS=$(printf '%s\n%s' \
-              "WIN_ISO_URL=${URL}" \
-              "WIN_ISO_SHA256=${SHA}")
+            echo "WIN_ISO_URL=${URL}"    >> "$ARGS_FILE"
+            echo "WIN_ISO_SHA256=${SHA}" >> "$ARGS_FILE"
           fi
 
+          # Emit as a multiline GITHUB_OUTPUT value.
           {
-            echo "build_args<<EOF"
-            echo "$BUILD_ARGS"
-            echo "EOF"
+            echo "build_args<<__EOF__"
+            cat "$ARGS_FILE"
+            echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
+
+          rm -f "$ARGS_FILE"
 
       - name: Build and push
         id: build
