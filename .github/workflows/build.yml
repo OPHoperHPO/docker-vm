@@ -8,12 +8,16 @@ on:
       - '.github/workflows/build.yml'
   workflow_dispatch:
     inputs:
+      win_version:
+        description: 'Windows version key from dockur/windows define.sh (e.g. win11x64, win11x64-enterprise-iot-eval, win10x64-enterprise-ltsc-eval)'
+        required: false
+        default: 'win11x64-enterprise-iot-eval'
       win_iso_url:
-        description: 'Windows ISO URL (overrides the default LTSC URL)'
+        description: 'Override: explicit Windows ISO URL (skips auto-resolve)'
         required: false
         default: ''
       win_iso_sha256:
-        description: 'SHA256 of the Windows ISO (must be set if win_iso_url is)'
+        description: 'Override: SHA256 (must be set if win_iso_url is)'
         required: false
         default: ''
       ubuntu_codename:
@@ -23,6 +27,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  # GHCR requires lowercase. github.repository can be MixedCase.
   IMAGE_NAMESPACE: ${{ github.repository }}
 
 jobs:
@@ -43,23 +48,19 @@ jobs:
           - target: windows
             context: ./images/windows
             image_suffix: windows-11
-            # mode=min for windows: the ISO layer is ~5 GB and would blow past
-            # the 10 GB GitHub Actions cache quota. Re-downloads from the MS
-            # CDN are fast (~3-5 min) so caching the ISO has poor ROI.
-            cache_mode: min
+            # mode=max caches the ISO download stage. Cold rebuilds are
+            # ~5 min on the multi-connection download; warm rebuilds (when
+            # only init scripts changed) skip the download entirely.
+            # ~5 GB cached layer fits GHA's 10 GB per-repo quota.
+            cache_mode: max
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Free up disk space
-        # GHA Ubuntu runners have ~14 GB free / ~25 GB total. The Windows
-        # image with a baked ISO needs >10 GB during build (download stage +
-        # final layers + buildx cache). We strip preinstalled SDKs we don't
-        # need to make room.
         run: |
           set -eux
-          # These directories are unconditionally large and unused by us.
           sudo rm -rf \
             /usr/share/dotnet \
             /usr/local/lib/android \
@@ -69,7 +70,6 @@ jobs:
             /usr/local/share/powershell \
             /usr/local/lib/heroku \
             "$AGENT_TOOLSDIRECTORY" || true
-          # Kill the default container/image cache.
           docker image prune -af || true
           docker builder prune -af || true
           df -h /
@@ -85,11 +85,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Lowercase the namespace once and reuse — GHCR rejects uppercase paths.
+      - name: Compute image ref
+        id: img
+        run: |
+          NS=$(echo "${{ env.IMAGE_NAMESPACE }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="${{ env.REGISTRY }}/${NS}-${{ matrix.image_suffix }}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image: ${IMAGE}"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}-${{ matrix.image_suffix }}
+          images: ${{ steps.img.outputs.image }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -98,26 +107,81 @@ jobs:
 
       - name: Compute build args
         id: args
+        env:
+          # Default Windows version when not running via workflow_dispatch.
+          # Win 11 IoT Enterprise LTSC — smallest official Win11 ISO.
+          DEFAULT_WIN_VERSION: win11x64-enterprise-iot-eval
         run: |
+          set -eu
           BUILD_ARGS=""
+
           if [ "${{ matrix.target }}" = "ubuntu" ]; then
             CODENAME="${{ github.event.inputs.ubuntu_codename }}"
             CODENAME="${CODENAME:-noble}"
             BUILD_ARGS="UBUNTU_CODENAME=${CODENAME}"
           fi
+
           if [ "${{ matrix.target }}" = "windows" ]; then
             URL="${{ github.event.inputs.win_iso_url }}"
             SHA="${{ github.event.inputs.win_iso_sha256 }}"
+
+            # If the user supplied an explicit URL, use it as-is (must come
+            # with its SHA256). Otherwise, resolve from dockur/windows' upstream
+            # define.sh — the same source mido.sh uses at runtime, kept current
+            # by the dockur project whenever Microsoft rotates the ISO.
             if [ -n "$URL" ]; then
               if [ -z "$SHA" ]; then
                 echo "::error::win_iso_sha256 must be set when win_iso_url is overridden" >&2
                 exit 1
               fi
-              BUILD_ARGS=$(printf '%s\n%s' \
-                "WIN_ISO_URL=${URL}" \
-                "WIN_ISO_SHA256=${SHA}")
+              echo "Using user-supplied URL: $URL"
+            else
+              VER="${{ github.event.inputs.win_version }}"
+              VER="${VER:-$DEFAULT_WIN_VERSION}"
+              echo "Resolving ISO URL+SHA for version: $VER"
+
+              DEFINE_SH=$(mktemp)
+              curl -fsSL --retry 3 \
+                https://raw.githubusercontent.com/dockur/windows/master/src/define.sh \
+                -o "$DEFINE_SH"
+
+              # Extract the case block matching the requested version key
+              # *inside the getMido() function* — the version key appears
+              # in several other places in define.sh that we must skip.
+              BLOCK=$(awk -v ver="$VER" '
+                /^getMido\(\)/                         { in_func=1; next }
+                in_func && /^\}/                       { exit }
+                in_func && $0 ~ "\""ver"\".*\\)"       { in_block=1 }
+                in_block                               { print }
+                in_block && /;;/                       { exit }
+              ' "$DEFINE_SH")
+
+              if [ -z "$BLOCK" ]; then
+                echo "::error::version key '$VER' not found in upstream define.sh" >&2
+                rm -f "$DEFINE_SH"
+                exit 1
+              fi
+
+              URL=$(echo "$BLOCK" | awk -F'"' '/url=/ {print $2; exit}')
+              SHA=$(echo "$BLOCK" | awk -F'"' '/sum=/ {print $2; exit}')
+              rm -f "$DEFINE_SH"
+
+              if [ -z "$URL" ] || [ -z "$SHA" ]; then
+                echo "::error::failed to extract url/sum for '$VER' from upstream define.sh" >&2
+                echo "::error::block was:" >&2
+                echo "$BLOCK" >&2
+                exit 1
+              fi
+
+              echo "Resolved URL: $URL"
+              echo "Resolved SHA: $SHA"
             fi
+
+            BUILD_ARGS=$(printf '%s\n%s' \
+              "WIN_ISO_URL=${URL}" \
+              "WIN_ISO_SHA256=${SHA}")
           fi
+
           {
             echo "build_args<<EOF"
             echo "$BUILD_ARGS"
@@ -125,6 +189,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
@@ -135,6 +200,27 @@ jobs:
           build-args: ${{ steps.args.outputs.build_args }}
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,mode=${{ matrix.cache_mode }},scope=${{ matrix.target }}
+
+      # Print docker pull commands directly into the workflow run summary so
+      # you don't need to dig into ghcr.io to find the image ref.
+      - name: Job summary
+        if: success() && github.event_name != 'pull_request'
+        run: |
+          {
+            echo "### \`${{ matrix.target }}\` image"
+            echo
+            echo "Pushed tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "Pull:"
+            echo '```bash'
+            echo "docker pull ${{ steps.img.outputs.image }}:latest"
+            echo '```'
+            echo
+            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Disk space after build
         if: always()
