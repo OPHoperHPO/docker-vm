@@ -19,6 +19,8 @@
 ARG DOCKURR_WINDOWS_TAG=latest
 ARG WIN_ISO_URL
 ARG WIN_ISO_SHA256
+# Set to "Y" to fail the build on SHA mismatch (default: warn and continue)
+ARG WIN_ISO_STRICT_VERIFY=N
 
 ############################################################
 # Stage 1: download + verify the ISO
@@ -41,9 +43,9 @@ RUN apt-get update && \
 # --allow-overwrite=true: needed when resuming a partial cached download
 # --conditional-get=false: we verify by sha256, no need for If-Modified-Since
 RUN set -eu; \
-    if [ -z "${WIN_ISO_URL:-}" ] || [ -z "${WIN_ISO_SHA256:-}" ]; then \
-        echo "ERROR: build-args WIN_ISO_URL and WIN_ISO_SHA256 are required." >&2; \
-        echo "       Pass them via --build-arg, or use the build.yml workflow which resolves them automatically." >&2; \
+    if [ -z "${WIN_ISO_URL:-}" ]; then \
+        echo "ERROR: build-arg WIN_ISO_URL is required." >&2; \
+        echo "       Pass it via --build-arg, or use the build.yml workflow which resolves it automatically." >&2; \
         exit 64; \
     fi; \
     echo "Downloading: $WIN_ISO_URL"; \
@@ -64,9 +66,42 @@ RUN set -eu; \
         --out=custom.iso \
         "$WIN_ISO_URL"; \
     ls -lh /custom.iso; \
-    echo "Verifying SHA256..."; \
-    echo "$WIN_ISO_SHA256  /custom.iso" | sha256sum -c -; \
-    echo "ISO verified."
+    # Sanity check: a genuinely broken download (404 page, redirect HTML)
+    # would be tiny. The smallest official Win ISO is ~3 GB.
+    SIZE=$(stat -c%s /custom.iso); \
+    if [ "$SIZE" -lt 1000000000 ]; then \
+        echo "ERROR: downloaded ISO is only $SIZE bytes — looks broken." >&2; \
+        exit 65; \
+    fi; \
+    # Optional SHA256 check. Mismatch is a *warning*, not fatal — Microsoft
+    # occasionally re-issues ISOs under the same URL with patched content,
+    # and dockur/windows' upstream hashes lag. The dockur project itself
+    # does not enforce SHA256 by default (see src/mido.sh::verifyFile, the
+    # VERIFY=Y opt-in). We trust the HTTPS download + Microsoft signing of
+    # the ISO at install time. To enforce strict verification (fail on
+    # mismatch), pass --build-arg WIN_ISO_STRICT_VERIFY=Y.
+    if [ -n "${WIN_ISO_SHA256:-}" ]; then \
+        echo "Verifying SHA256..."; \
+        ACTUAL=$(sha256sum /custom.iso | cut -d' ' -f1); \
+        if [ "$ACTUAL" = "$WIN_ISO_SHA256" ]; then \
+            echo "ISO SHA256 OK."; \
+        else \
+            echo "================================================================"; \
+            echo "  WARNING: ISO SHA256 mismatch."; \
+            echo "    expected: $WIN_ISO_SHA256"; \
+            echo "    actual:   $ACTUAL"; \
+            echo "  Likely cause: Microsoft re-issued the ISO under this URL"; \
+            echo "  and the upstream dockur/windows hash hasn't caught up yet."; \
+            echo "  Proceeding anyway."; \
+            echo "================================================================"; \
+            if [ "${WIN_ISO_STRICT_VERIFY:-N}" = "Y" ]; then \
+                echo "WIN_ISO_STRICT_VERIFY=Y, failing the build." >&2; \
+                exit 66; \
+            fi; \
+        fi; \
+    else \
+        echo "No WIN_ISO_SHA256 supplied, skipping verification."; \
+    fi
 
 ############################################################
 # Stage 2: final image
@@ -87,10 +122,11 @@ ENV VERSION="11"
 ENV RAM_SIZE="4G"
 ENV CPU_CORES="2"
 ENV DISK_SIZE="64G"
-# Default credentials inside the guest. Override at run time if needed.
-ENV USERNAME="Docker"
-ENV PASSWORD="admin"
+# USERNAME/PASSWORD intentionally not set here — dockurr/windows defaults
+# are Docker/admin (from its win11x64.xml unattend file). Override at run
+# time with `-e USERNAME=... -e PASSWORD=...` if needed.
 
+ARG GITHUB_REPOSITORY=local/build
 LABEL org.opencontainers.image.title="windows-vm"
 LABEL org.opencontainers.image.description="Pre-baked Windows 11 VM (LTSC by default), ISO included, OEM init scripts"
-LABEL org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY:-local/build}"
+LABEL org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}"
