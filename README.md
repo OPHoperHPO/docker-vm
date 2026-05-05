@@ -1,171 +1,185 @@
-# Pre-baked QEMU VM Docker images
+# Pre-baked VM Docker images
 
-Two opinionated Docker images that wrap a pre-installed VM and run an
-initialization script on first boot. Both publish to GHCR via GitHub Actions.
+Два Docker-образа с уже встроенной ОС и init-скриптами. Под капотом —
+QEMU/KVM (`qemux/qemu` и `dockurr/windows`).
 
-| Image                                  | Base               | OS         | First-boot mechanism            | Image size  |
-| -------------------------------------- | ------------------ | ---------- | ------------------------------- | ----------- |
-| `ghcr.io/<you>/<repo>-ubuntu-24.04`    | `qemux/qemu`       | Ubuntu 24.04 (cloud image) | cloud-init NoCloud seed   | ~1.0 GB     |
-| `ghcr.io/<you>/<repo>-windows-11`      | `dockurr/windows`* | Windows 11 IoT LTSC | OEM `install.bat` at first logon | **~6.3 GB** |
+| Образ | ОС | Размер |
+|---|---|---|
+| `ghcr.io/<you>/<repo>-ubuntu-24.04` | Ubuntu 24.04 cloud image | ~1 GB |
+| `ghcr.io/<you>/<repo>-windows-11` | Windows 11 IoT LTSC | ~6.3 GB |
 
-\* `dockurr/windows` itself is built `FROM qemux/qemu` (see its Dockerfile),
-so the Windows image transitively satisfies the "on top of qemux/qemu"
-requirement. We layer on `dockurr/windows` because it brings the things
-you'd otherwise have to re-implement: virtio drivers ISO, mido (the Microsoft
-ISO downloader), samba host share, and the unattend answer files.
+Никаких скачиваний при первом старте — ISO/qcow2 уже внутри образа.
 
 ---
 
-## Repo layout
+## Структура
 
 ```
 .
-├── .github/workflows/build.yml      # CI: matrix build + push to GHCR
+├── .github/workflows/build.yml      # CI: matrix-сборка → push в GHCR
 └── images/
     ├── ubuntu/
-    │   ├── Dockerfile               # Bakes cloud image + cloud-init seed
-    │   ├── start.sh                 # Override of qemux/qemu's start hook
+    │   ├── Dockerfile               # Бакает cloud-image и cloud-init seed
+    │   ├── start.sh                 # Хук: копирует qcow2 в /storage на 1-м запуске
     │   └── cloud-init/
-    │       ├── user-data            # ⇐ edit this for first-boot logic
+    │       ├── user-data            # ⇐ редактируй это
     │       └── meta-data
     └── windows/
-        ├── Dockerfile               # Bakes the Windows ISO + /oem
+        ├── Dockerfile               # Бакает Win11 ISO + /oem
         └── oem/
-            ├── install.bat          # ⇐ entry point, runs at first logon
-            └── firstboot.ps1        # ⇐ where to put real init logic
+            ├── install.bat          # ⇐ запускается на 1-м логине
+            └── firstboot.ps1        # ⇐ сюда логику инициализации
 ```
 
 ---
 
-## How the Ubuntu image works
+## Запуск
 
-The build downloads the Ubuntu 24.04 cloud image (`*.cloudimg.amd64.img`,
-~700 MB) — it's already an installed Ubuntu system, not an installer ISO.
-We resize the virtual disk to 64 GB and ship it at `/opt/baked/boot.qcow2`.
+### docker-compose (рекомендуется)
 
-A NoCloud cloud-init seed is generated from `cloud-init/user-data` +
-`meta-data` and shipped at `/start.iso`. Inside the container, qemux/qemu
-mounts `/start.iso` automatically as a second CD-ROM (this is its built-in
-"RESCUE" media slot — see `qemu-master/src/disk.sh` line 697). cloud-init
-sees the `cidata`-volid CD-ROM, applies the config, and runs the embedded
-firstboot script.
+Минимум привилегий, доступ из других контейнеров через docker network:
 
-A custom `/run/start.sh` hook copies `/opt/baked/boot.qcow2` into
-`/storage/boot.qcow2` on first run, so writes inside the VM persist across
-container restarts via the bound storage volume. qemux/qemu's
-`install.sh::findFile` then picks up the qcow2 from `/storage` and boots it
-directly without any download.
+```yaml
+networks:
+  vm-net:
+    driver: bridge
 
-To customize first-boot behavior, edit `images/ubuntu/cloud-init/user-data`
-(the `runcmd:` and `write_files:` sections). Note that cloud-init only runs
-**once per disk image** — to re-run, delete the storage volume.
+services:
+  ubuntu:
+    image: ghcr.io/<you>/<repo>-ubuntu-24.04:latest
+    networks: [vm-net]
+    devices:
+      - /dev/kvm                    # единственное обязательное устройство
+    environment:
+      NETWORK: passt                # user-mode networking (без NET_ADMIN)
+      PASST_OPTS: "-t all -u all"   # форвард всех TCP+UDP портов VM
+    ports:
+      - "8006:8006"                 # web-консоль qemu (только для тебя)
+    volumes:
+      - ./ubuntu-storage:/storage
 
-### Run it
+  windows:
+    image: ghcr.io/<you>/<repo>-windows-11:latest
+    networks: [vm-net]
+    devices:
+      - /dev/kvm
+    environment:
+      NETWORK: passt
+      PASST_OPTS: "-t all -u all"
+    ports:
+      - "8007:8006"                 # web-консоль (порт изменён, чтобы не конфликтовал)
+    volumes:
+      - ./windows-storage:/storage
+    stop_grace_period: 2m
+
+  # пример клиента — ходит в VM просто по имени сервиса:
+  app:
+    image: alpine
+    networks: [vm-net]
+    command: sh -c "apk add --no-cache curl && curl http://ubuntu:8080"
+```
+
+После `docker compose up`:
+- Web-консоль Ubuntu: <http://localhost:8006>
+- Web-консоль Windows: <http://localhost:8007>
+- Из других контейнеров на `vm-net`: `ubuntu:<port>`, `windows:3389` (RDP), `windows:445` (SMB), и т.д.
+
+### docker run
 
 ```bash
-docker run -it --rm --name ubuntu-vm \
-  --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
-  -p 8006:8006 -p 2222:22 \
+docker run -d --name ubuntu-vm \
+  --device=/dev/kvm \
+  -e NETWORK=passt -e PASST_OPTS="-t all -u all" \
+  -p 8006:8006 \
   -v ./ubuntu-storage:/storage \
   ghcr.io/<you>/<repo>-ubuntu-24.04:latest
 ```
 
-Open `http://localhost:8006` for the web console, or
-`ssh ubuntu@localhost -p 2222` (default password: `ubuntu`, override via
-cloud-init).
+Первый запуск Ubuntu — ~30 секунд до cloud-init готовности.
+Первый запуск Windows — ~10–15 минут unattended-инсталляции (диск, не сеть).
+SSH/RDP credentials по умолчанию: `ubuntu/ubuntu`, `Docker/admin`.
 
 ---
 
-## How the Windows image works
+## Инициализация
 
-The build downloads the **Windows 11 IoT Enterprise LTSC** ISO (~4.7 GB,
-SHA256-verified) at build time and ships it at `/custom.iso` inside the
-image. On first run, `dockurr/windows` finds the pre-baked ISO via its
-`findFile()` logic in `install.sh`, skips the mido download path, and
-proceeds with the unattended installation. **Zero ISO download at run time.**
+### Ubuntu
 
-Why IoT LTSC by default?
-- **4.7 GB** vs **7.2 GB** for the consumer Pro/Home build — final image is
-  ~6 GB instead of ~9 GB. Friendlier for slow `docker pull` and the GHA
-  10 GB cache quota.
-- It's the most stable Win11 SKU — no forced feature updates, no Cortana,
-  no Edge bloatware, no Microsoft Store cruft.
-- The eval license gives you 90 days; after that the desktop watermarks
-  and reboots hourly but the OS itself keeps working. Plenty for lab use.
+Редактируй `images/ubuntu/cloud-init/user-data`. Релевантные секции:
 
-The `/oem/install.bat` runs at first user logon. dockurr/windows's default
-unattend XML for Win11 already contains:
+```yaml
+runcmd:
+  - [ /opt/firstboot.sh ]   # отсюда вызывается твой скрипт
 
-```xml
-<CommandLine>cmd /C if exist "C:\OEM\install.bat" start "Install" "cmd /C C:\OEM\install.bat"</CommandLine>
+write_files:
+  - path: /opt/firstboot.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # ВОТ СЮДА твою логику
 ```
 
-so anything dropped into `/oem/` ends up at `C:\OEM\` inside Windows and
-`install.bat` fires automatically. We chain to `firstboot.ps1` for any real
-work — that's where you put your `winget install`, registry tweaks, etc.
+cloud-init выполнится **один раз** на свежем диске. Чтобы пере-запустить —
+удали `./ubuntu-storage` и перезапусти контейнер.
 
-### Run it
+### Windows
 
-```bash
-docker run -it --rm --name windows-vm \
-  --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
-  -p 8006:8006 -p 3389:3389/tcp -p 3389:3389/udp \
-  -v ./windows-storage:/storage \
-  --stop-timeout 120 \
-  ghcr.io/<you>/<repo>-windows-11:latest
-```
+Редактируй `images/windows/oem/firstboot.ps1` (PowerShell) или
+`images/windows/oem/install.bat`. Файлы попадают в `C:\OEM\` внутри Windows,
+`install.bat` запускается автоматически на первом логине через встроенный
+FirstLogonCommand в дефолтном unattend XML.
 
-Open `http://localhost:8006` for installation progress, then RDP to
-`localhost:3389` (user `Docker`, password `admin`) once it's ready.
-First run takes ~10–15 min for the unattended install to complete; this is
-disk-I/O bound, not network — the ISO is already local.
+Логи — `C:\OEM\install.log`.
 
-### Switching to the Consumer build
+После любого изменения init-скриптов нужно пересобрать образ
+(workflow триггернётся на push) и удалить storage-volume для re-run.
 
-If you actually want vanilla Windows 11 Pro/Home, run the workflow manually
-with the consumer URL + hash from
-[`windows-master/src/define.sh:712`](https://github.com/dockur/windows/blob/master/src/define.sh):
+---
+
+## Режимы сети (overview)
+
+В compose-примере выше — `passt`. Если нужно что-то другое:
+
+| `NETWORK=` | Привилегии | Когда использовать |
+|---|---|---|
+| `passt` (compose выше) | `/dev/kvm` | По умолчанию для всего |
+| `slirp` | `/dev/kvm` | Если passt падает (старое ядро) |
+| `tap` (default в `qemux/qemu`) | `+ NET_ADMIN, /dev/net/tun` | Нужна максимальная пропускная способность |
+| `DHCP=Y` (macvlan) | `+ NET_ADMIN, vhost-net, cgroup rules` | VM нужен свой IP в LAN роутера |
+
+Для passt порты можно либо `PASST_OPTS="-t all -u all"` (всё), либо
+`USER_PORTS="22,80,443"` (явный список).
+
+---
+
+## CI / GHCR
+
+Workflow `Build VM images` собирает оба образа на push в `main` и пушит в
+GHCR. Permissions: репо → Settings → Actions → General → "Read and write
+permissions" для `GITHUB_TOKEN`.
+
+Ручной запуск с переопределением Windows ISO:
 
 ```bash
 gh workflow run "Build VM images" \
-  -f win_iso_url='https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso' \
-  -f win_iso_sha256='d141f6030fed50f75e2b03e1eb2e53646c4b21e5386047cb860af5223f102a32'
+  -f win_iso_url='https://software-static.download.prss.microsoft.com/.../...iso' \
+  -f win_iso_sha256='<sha256>'
 ```
 
-### When the URL goes stale
-
-Microsoft rotates these URLs whenever a new build ships (every few months).
-If `sha256sum -c` fails in CI, the `dockur/windows` project has already
-updated `src/define.sh` with the new URL+hash by the time you notice.
-Either:
-1. Update `WIN_ISO_URL` and `WIN_ISO_SHA256` in `images/windows/Dockerfile`, or
-2. Run the workflow with `workflow_dispatch` inputs to override.
+URL+hash для других редакций Windows смотри в
+[`dockur/windows/src/define.sh`](https://github.com/dockur/windows/blob/master/src/define.sh)
+(функция `getMido`). Когда дефолтный URL стухнет (Microsoft меняет билды раз
+в 3–6 месяцев), `sha256sum -c` упадёт в CI — обнови
+`WIN_ISO_URL`/`WIN_ISO_SHA256` в `images/windows/Dockerfile` оттуда же.
 
 ---
 
-## Requirements at run time
+## Требования к хосту
 
-- Linux host with KVM available (`/dev/kvm` exists). `kvm-ok` should pass.
-- Cloud / VPS hosts often disable nested virtualization — check before
-  deploying there.
-- 2 vCPU + 2 GB RAM minimum for Ubuntu, 2 vCPU + 4 GB RAM minimum for Windows.
-- ~10 GB free disk for the Windows storage volume (ISO is read once into
-  storage, then a 64 GB sparse qcow2 is created for the OS install).
+- Linux + `/dev/kvm` (KVM включён в BIOS, ядро не блокирует).
+- ~10 GB свободного диска под Windows storage volume (sparse qcow2 64 GB).
+- Не работает на cloud VPS без nested virt (большинство — без).
 
-## Customization at run time
-
-Both images respect the standard env vars from `qemux/qemu` /
-`dockurr/windows`:
-
-| Var          | Default (Ubuntu / Windows) | Effect                       |
-| ------------ | -------------------------- | ---------------------------- |
-| `CPU_CORES`  | 2 / 2                      | Number of vCPUs              |
-| `RAM_SIZE`   | 2G / 4G                    | RAM size                     |
-| `DISK_SIZE`  | 64G / 64G                  | Disk size                    |
-| `USERNAME`   | — / Docker                 | Windows guest user           |
-| `PASSWORD`   | — / admin                  | Windows guest password       |
-| `DHCP`       | N                          | Use macvlan + DHCP for VM IP |
-
-See [github.com/qemus/qemu](https://github.com/qemus/qemu) and
-[github.com/dockur/windows](https://github.com/dockur/windows) for the full
-list.
+Полный список env-переменных:
+[qemus/qemu](https://github.com/qemus/qemu),
+[dockur/windows](https://github.com/dockur/windows).

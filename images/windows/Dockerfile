@@ -4,20 +4,21 @@
 # inside the image at /custom.iso so the running container performs no
 # network I/O for the OS itself.
 #
-# Defaults to "Windows 11 IoT Enterprise LTSC eval" (4.7 GB) because it is the
-# smallest official Win11 ISO Microsoft publishes — best for slow links. To
-# bake the consumer build instead, pass:
-#   --build-arg WIN_ISO_URL=...consumer URL... --build-arg WIN_ISO_SHA256=...
+# WIN_ISO_URL and WIN_ISO_SHA256 are required build args. The CI workflow
+# resolves them dynamically from dockur/windows' src/define.sh. For local
+# builds, pass them explicitly:
 #
-# URLs and hashes are taken verbatim from dockur/windows' src/define.sh
-# (function getMido), which is the same source mido.sh uses at runtime.
-# When Microsoft rotates the build, these need to be refreshed — see README.
+#   docker build \
+#     --build-arg WIN_ISO_URL=https://... \
+#     --build-arg WIN_ISO_SHA256=<hex> \
+#     -t windows-vm ./images/windows
+#
+# Find URL+hash for any Win version in:
+# https://github.com/dockur/windows/blob/master/src/define.sh (function getMido)
 
 ARG DOCKURR_WINDOWS_TAG=latest
-
-# Win11 IoT Enterprise LTSC 24H2 — release 26100.1.240331-1435 (~4.7 GB)
-ARG WIN_ISO_URL=https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1.240331-1435.ge_release_CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso
-ARG WIN_ISO_SHA256=2cee70bd183df42b92a2e0da08cc2bb7a2a9ce3a3841955a012c0f77aeb3cb29
+ARG WIN_ISO_URL
+ARG WIN_ISO_SHA256
 
 ############################################################
 # Stage 1: download + verify the ISO
@@ -28,17 +29,40 @@ ARG WIN_ISO_URL
 ARG WIN_ISO_SHA256
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl && \
+    apt-get install -y --no-install-recommends ca-certificates aria2 && \
     rm -rf /var/lib/apt/lists/*
 
-# --retry-all-errors makes curl recover from transient TLS / 5xx errors which
-# happen on this CDN occasionally. --continue-at - resumes if the layer cache
-# was partial (it won't be in clean CI, but harmless).
+# aria2c does multi-connection downloading (HTTP range requests). Microsoft's
+# CDN allows it and serves each connection at full single-stream speed, so
+# 16 parallel streams = ~16x throughput vs single-stream curl. Empirically
+# this takes the ~5 GB ISO from ~20 min to ~1.5 min on GitHub runners.
+#
+# --auto-file-renaming=false: keep our hardcoded filename
+# --allow-overwrite=true: needed when resuming a partial cached download
+# --conditional-get=false: we verify by sha256, no need for If-Modified-Since
 RUN set -eu; \
+    if [ -z "${WIN_ISO_URL:-}" ] || [ -z "${WIN_ISO_SHA256:-}" ]; then \
+        echo "ERROR: build-args WIN_ISO_URL and WIN_ISO_SHA256 are required." >&2; \
+        echo "       Pass them via --build-arg, or use the build.yml workflow which resolves them automatically." >&2; \
+        exit 64; \
+    fi; \
     echo "Downloading: $WIN_ISO_URL"; \
-    curl -fL --retry 5 --retry-delay 10 --retry-all-errors \
-         --continue-at - \
-         -o /custom.iso "$WIN_ISO_URL"; \
+    aria2c \
+        --max-connection-per-server=16 \
+        --split=16 \
+        --min-split-size=1M \
+        --max-tries=5 \
+        --retry-wait=10 \
+        --connect-timeout=30 \
+        --timeout=60 \
+        --auto-file-renaming=false \
+        --allow-overwrite=true \
+        --check-certificate=true \
+        --console-log-level=warn \
+        --summary-interval=10 \
+        --dir=/ \
+        --out=custom.iso \
+        "$WIN_ISO_URL"; \
     ls -lh /custom.iso; \
     echo "Verifying SHA256..."; \
     echo "$WIN_ISO_SHA256  /custom.iso" | sha256sum -c -; \
