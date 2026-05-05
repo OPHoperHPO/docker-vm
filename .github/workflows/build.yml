@@ -1,0 +1,141 @@
+name: Build VM images
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'images/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      win_iso_url:
+        description: 'Windows ISO URL (overrides the default LTSC URL)'
+        required: false
+        default: ''
+      win_iso_sha256:
+        description: 'SHA256 of the Windows ISO (must be set if win_iso_url is)'
+        required: false
+        default: ''
+      ubuntu_codename:
+        description: 'Ubuntu codename (e.g. noble for 24.04, jammy for 22.04)'
+        required: false
+        default: 'noble'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: ubuntu
+            context: ./images/ubuntu
+            image_suffix: ubuntu-24.04
+            cache_mode: max
+          - target: windows
+            context: ./images/windows
+            image_suffix: windows-11
+            # mode=min for windows: the ISO layer is ~5 GB and would blow past
+            # the 10 GB GitHub Actions cache quota. Re-downloads from the MS
+            # CDN are fast (~3-5 min) so caching the ISO has poor ROI.
+            cache_mode: min
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        # GHA Ubuntu runners have ~14 GB free / ~25 GB total. The Windows
+        # image with a baked ISO needs >10 GB during build (download stage +
+        # final layers + buildx cache). We strip preinstalled SDKs we don't
+        # need to make room.
+        run: |
+          set -eux
+          # These directories are unconditionally large and unused by us.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/local/share/powershell \
+            /usr/local/lib/heroku \
+            "$AGENT_TOOLSDIRECTORY" || true
+          # Kill the default container/image cache.
+          docker image prune -af || true
+          docker builder prune -af || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}-${{ matrix.image_suffix }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Compute build args
+        id: args
+        run: |
+          BUILD_ARGS=""
+          if [ "${{ matrix.target }}" = "ubuntu" ]; then
+            CODENAME="${{ github.event.inputs.ubuntu_codename }}"
+            CODENAME="${CODENAME:-noble}"
+            BUILD_ARGS="UBUNTU_CODENAME=${CODENAME}"
+          fi
+          if [ "${{ matrix.target }}" = "windows" ]; then
+            URL="${{ github.event.inputs.win_iso_url }}"
+            SHA="${{ github.event.inputs.win_iso_sha256 }}"
+            if [ -n "$URL" ]; then
+              if [ -z "$SHA" ]; then
+                echo "::error::win_iso_sha256 must be set when win_iso_url is overridden" >&2
+                exit 1
+              fi
+              BUILD_ARGS=$(printf '%s\n%s' \
+                "WIN_ISO_URL=${URL}" \
+                "WIN_ISO_SHA256=${SHA}")
+            fi
+          fi
+          {
+            echo "build_args<<EOF"
+            echo "$BUILD_ARGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ steps.args.outputs.build_args }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=${{ matrix.cache_mode }},scope=${{ matrix.target }}
+
+      - name: Disk space after build
+        if: always()
+        run: df -h /
