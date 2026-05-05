@@ -58,6 +58,7 @@ ENV CPU_CORES=2
 ENV RAM_SIZE=2G
 ENV DISK_SIZE=64G
 
+ARG GITHUB_REPOSITORY=local/build
 LABEL org.opencontainers.image.title="ubuntu-vm"
 LABEL org.opencontainers.image.description="Pre-baked Ubuntu cloud-image VM running under QEMU/KVM"
-LABEL org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY:-local/build}"
+LABEL org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}"
