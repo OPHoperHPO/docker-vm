@@ -15,15 +15,17 @@
 # Build from the repository root, not from this directory:
 #   docker build -f images/macos/Dockerfile -t macos-vm .
 #
-# Apple's recovery endpoint refuses some networks. If the build fails while
-# fetching, build with --build-arg BAKE_RECOVERY=N; the container then falls
-# back to downloading the recovery image on its first start, exactly as
-# dockurr/macos does.
+# Apple's recovery endpoint refuses some networks, so BAKE_RECOVERY chooses what
+# happens then:
+#   auto (default)  try to bake; on refusal warn and leave it to first start
+#   Y               bake, and fail the build if Apple refuses
+#   N               never bake; download on first start, as dockurr/macos does
+# Whichever path runs, the container says at startup which image it is using.
 
 ARG DOCKURR_MACOS_TAG=latest
 ARG GO_VERSION=1.24
 ARG MACOS_VERSION=15
-ARG BAKE_RECOVERY=Y
+ARG BAKE_RECOVERY=auto
 
 ############################################################
 # Stage 1: the network policy enforcer (no dependencies, no network needed)
@@ -48,7 +50,7 @@ COPY --chmod=755 images/macos/fetch-recovery.sh /usr/local/bin/fetch-recovery.sh
 # bake costs nothing.
 RUN set -eu; \
     mkdir -p /out; \
-    if [ "${BAKE_RECOVERY}" != "Y" ]; then \
+    if [ "${BAKE_RECOVERY}" = "N" ]; then \
         echo "BAKE_RECOVERY=N: the recovery image will be downloaded on first start."; \
         exit 0; \
     fi; \
@@ -56,7 +58,20 @@ RUN set -eu; \
     apt-get install -y --no-install-recommends \
         ca-certificates curl aria2 p7zip-full qemu-utils; \
     rm -rf /var/lib/apt/lists/*; \
-    fetch-recovery.sh "${MACOS_VERSION}" /out/boot.dmg
+    if fetch-recovery.sh "${MACOS_VERSION}" /out/boot.dmg; then \
+        exit 0; \
+    fi; \
+    rm -f /out/boot.dmg; \
+    if [ "${BAKE_RECOVERY}" = "Y" ]; then \
+        echo "ERROR: BAKE_RECOVERY=Y and Apple refused the download." >&2; \
+        exit 1; \
+    fi; \
+    echo "=================================================================="; \
+    echo " WARNING: Apple refused the recovery download from this network."; \
+    echo " The image is being built without it, so the container will fetch"; \
+    echo " the recovery image on its first start instead."; \
+    echo " Build with --build-arg BAKE_RECOVERY=Y to make this fatal."; \
+    echo "=================================================================="
 
 ############################################################
 # Stage 3: final image

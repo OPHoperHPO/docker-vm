@@ -44,9 +44,9 @@ on:
         required: false
         default: '15'
       bake_recovery:
-        description: 'Download the macOS recovery image at build time (Y/N)'
+        description: 'Bake the macOS recovery image at build time: auto (warn on refusal), Y (fail), N (never)'
         required: false
-        default: 'Y'
+        default: 'auto'
 
 env:
   REGISTRY: ghcr.io
@@ -245,7 +245,7 @@ jobs:
             MACOS_VERSION="${{ github.event.inputs.macos_version }}"
             MACOS_VERSION="${MACOS_VERSION:-15}"
             BAKE="${{ github.event.inputs.bake_recovery }}"
-            BAKE="${BAKE:-Y}"
+            BAKE="${BAKE:-auto}"
             echo "MACOS_VERSION=${MACOS_VERSION}" >> "$ARGS_FILE"
             echo "BAKE_RECOVERY=${BAKE}" >> "$ARGS_FILE"
           fi
