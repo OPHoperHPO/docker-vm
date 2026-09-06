@@ -1,0 +1,9 @@
+# Everything the images need is listed explicitly in the Dockerfiles; keeping
+# the context small keeps cold builds fast.
+.git
+.github
+docs
+examples
+**/*.md
+**/testdata
+shared/vmguard/*_test.go

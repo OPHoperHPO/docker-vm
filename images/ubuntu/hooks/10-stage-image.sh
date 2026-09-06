@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Startup hook for the pre-baked Ubuntu image.
+# Image hook for the pre-baked Ubuntu image, sourced from /run/start.sh before
+# the base image's own install/disk scripts.
 #
-# qemux/qemu sources this file before its own install/disk scripts. We use the
-# hook to copy the baked cloud image into persistent storage and to grow that
-# boot image when DISK_SIZE/BOOT_DISK_SIZE is increased at container start.
+# It copies the baked cloud image into persistent storage on the first run and
+# grows that boot image when DISK_SIZE/BOOT_DISK_SIZE is increased at container
+# start.
 
 set -Eeuo pipefail
 
