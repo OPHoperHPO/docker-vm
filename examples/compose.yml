@@ -1,0 +1,86 @@
+# Три VM с разными политиками доступа к сети.
+#
+# Единственное обязательное устройство — /dev/kvm. Ни NET_ADMIN, ни
+# /dev/net/tun, ни privileged здесь не нужны.
+#
+#   docker compose -f examples/compose.yml up -d
+#
+# Замени <you>/<repo> на свой GHCR namespace.
+
+services:
+
+  # ---------------------------------------------------------------------
+  # Ubuntu: ходит в интернет, но не видит домашнюю сеть и соседние
+  # контейнеры. Типичный вариант для CI-раннера.
+  # ---------------------------------------------------------------------
+  ubuntu:
+    image: ghcr.io/<you>/<repo>-ubuntu-24.04:latest
+    restart: always
+    stop_grace_period: 2m
+    devices:
+      - /dev/kvm
+    volumes:
+      - ./ubuntu-storage:/storage
+    ports:
+      - 127.0.0.1:8006:8006     # web-консоль
+      - 127.0.0.1:2222:22       # ssh внутрь VM
+    environment:
+      CPU_MODEL: host
+      CPU_CORES: 8
+      RAM_SIZE: 16G
+      DISK_SIZE: 150G
+      USER_PORTS: "22"
+
+      NET_PRESET: internet
+      NET_GUARD_HTTP: ":8010"   # статус фильтра, см. ниже
+
+  # ---------------------------------------------------------------------
+  # Windows: наружу пускаем только по явному списку. Всё остальное
+  # обрывается сразу, с RST, а не по таймауту.
+  # ---------------------------------------------------------------------
+  windows:
+    image: ghcr.io/<you>/<repo>-windows-11:latest
+    restart: always
+    stop_grace_period: 2m
+    devices:
+      - /dev/kvm
+    volumes:
+      - ./windows-storage:/storage
+    ports:
+      - 127.0.0.1:8007:8006
+      - 127.0.0.1:3389:3389
+    environment:
+      CPU_CORES: 4
+      RAM_SIZE: 8G
+      DISK_SIZE: 64G
+      USER_PORTS: "3389,445"
+
+      NET_POLICY: deny
+      NET_ALLOW: >-
+        tcp:*:80,443
+        udp:*:123
+
+  # ---------------------------------------------------------------------
+  # macOS: без ограничений — установщику нужен доступ к серверам Apple.
+  # Первые шаги установки делаются в web-консоли, см. README.
+  # ---------------------------------------------------------------------
+  macos:
+    image: ghcr.io/<you>/<repo>-macos:latest
+    restart: always
+    stop_grace_period: 2m
+    devices:
+      - /dev/kvm
+    volumes:
+      - ./macos-storage:/storage
+    ports:
+      - 127.0.0.1:8008:8006
+      - 127.0.0.1:5900:5900
+    environment:
+      CPU_CORES: 4
+      RAM_SIZE: 8G
+      DISK_SIZE: 128G
+
+# Посмотреть, что фильтр реально режет:
+#   docker compose -f examples/compose.yml logs ubuntu | grep blocked
+#   docker compose -f examples/compose.yml exec ubuntu \
+#     curl -s 'http://127.0.0.1:8010/?text=1'

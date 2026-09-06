@@ -2,12 +2,27 @@ name: Build VM images
 
 on:
   push:
-    branches: [master]
+    branches: ['**']
     paths:
       - 'images/**'
+      - 'shared/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'images/**'
+      - 'shared/**'
       - '.github/workflows/build.yml'
   workflow_dispatch:
     inputs:
+      push_images:
+        description: 'Push the built images to GHCR (only ever needed off the default branch)'
+        type: boolean
+        required: false
+        default: false
+      targets:
+        description: 'Which images to build: all, ubuntu, windows, macos'
+        required: false
+        default: 'all'
       win_version:
         description: 'Windows version key from dockur/windows define.sh (e.g. win11x64, win11x64-enterprise-iot-eval, win10x64-enterprise-ltsc-eval)'
         required: false
@@ -24,6 +39,14 @@ on:
         description: 'Ubuntu codename (e.g. noble for 24.04, jammy for 22.04)'
         required: false
         default: 'noble'
+      macos_version:
+        description: 'macOS version to bake (15/sequoia, 14/sonoma, 13/ventura, ...)'
+        required: false
+        default: '15'
+      bake_recovery:
+        description: 'Download the macOS recovery image at build time (Y/N)'
+        required: false
+        default: 'Y'
 
 env:
   REGISTRY: ghcr.io
@@ -31,8 +54,64 @@ env:
   IMAGE_NAMESPACE: ${{ github.repository }}
 
 jobs:
+  # The network policy is the one part of this repository with real logic in
+  # it, so it is tested before anything is built.
+  test:
+    name: Test vmguard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: shared/vmguard/go.mod
+          # vmguard deliberately has no dependencies, so there is nothing to cache.
+          cache: false
+
+      - name: Check formatting
+        working-directory: shared/vmguard
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would rewrite: $unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: Vet
+        working-directory: shared/vmguard
+        run: |
+          go vet ./...
+          go vet -tags integration ./...
+
+      - name: Unit tests
+        working-directory: shared/vmguard
+        run: go test -race -count=1 ./...
+
+      # The interposition only matters if it works against the real passt, so
+      # the integration tests run inside the base image that ships it.
+      - name: Integration tests against real passt
+        working-directory: shared/vmguard
+        run: |
+          go test -tags integration -c -o /tmp/vmguard.test .
+          docker run --rm -v /tmp/vmguard.test:/vmguard.test \
+            --entrypoint /vmguard.test qemux/qemu:latest \
+            -test.v -test.timeout 300s -test.run TestIntegration
+
+      - name: Shell hooks
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          mapfile -t scripts < <(find shared/hooks images -name '*.sh' -type f | sort)
+          printf 'checking: %s\n' "${scripts[@]}"
+          for f in "${scripts[@]}"; do bash -n "$f"; done
+          # SC1091: the sourced files only exist inside the built image.
+          shellcheck -S warning -e SC1091 "${scripts[@]}"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -42,23 +121,56 @@ jobs:
       matrix:
         include:
           - target: ubuntu
-            context: ./images/ubuntu
             image_suffix: ubuntu-24.04
             cache_mode: max
           - target: windows
-            context: ./images/windows
             image_suffix: windows-11
             # mode=max caches the ISO download stage. Cold rebuilds are
             # ~5 min on the multi-connection download; warm rebuilds (when
             # only init scripts changed) skip the download entirely.
             # ~5 GB cached layer fits GHA's 10 GB per-repo quota.
             cache_mode: max
+          - target: macos
+            image_suffix: macos
+            cache_mode: max
 
     steps:
+      - name: Decide whether this target runs
+        id: gate
+        env:
+          REQUESTED: ${{ github.event.inputs.targets }}
+        run: |
+          REQUESTED="${REQUESTED:-all}"
+          if [ "$REQUESTED" = "all" ] || [ "$REQUESTED" = "${{ matrix.target }}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping ${{ matrix.target }}: only '$REQUESTED' was requested."
+          fi
+
+      # Images are pushed from the default branch only. Everywhere else the
+      # build runs in full but publishes nothing, so a branch can never put a
+      # half-finished image into the package registry.
+      - name: Decide whether to publish
+        id: publish
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.ref }}" = "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.inputs.push_images }}" = "true" ]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"
+            echo "Not on the default branch: building without publishing."
+          fi
+
       - name: Checkout
+        if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@v4
 
       - name: Free up disk space
+        if: steps.gate.outputs.run == 'true'
         run: |
           set -eux
           sudo rm -rf \
@@ -75,10 +187,11 @@ jobs:
           df -h /
 
       - name: Set up Docker Buildx
+        if: steps.gate.outputs.run == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: steps.gate.outputs.run == 'true' && steps.publish.outputs.push == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -87,6 +200,7 @@ jobs:
 
       # Lowercase the namespace once and reuse — GHCR rejects uppercase paths.
       - name: Compute image ref
+        if: steps.gate.outputs.run == 'true'
         id: img
         run: |
           NS=$(echo "${{ env.IMAGE_NAMESPACE }}" | tr '[:upper:]' '[:lower:]')
@@ -95,6 +209,7 @@ jobs:
           echo "Resolved image: ${IMAGE}"
 
       - name: Extract metadata
+        if: steps.gate.outputs.run == 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -106,6 +221,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Compute build args
+        if: steps.gate.outputs.run == 'true'
         id: args
         env:
           # Default Windows version when not running via workflow_dispatch.
@@ -123,6 +239,15 @@ jobs:
             CODENAME="${{ github.event.inputs.ubuntu_codename }}"
             CODENAME="${CODENAME:-noble}"
             echo "UBUNTU_CODENAME=${CODENAME}" >> "$ARGS_FILE"
+          fi
+
+          if [ "${{ matrix.target }}" = "macos" ]; then
+            MACOS_VERSION="${{ github.event.inputs.macos_version }}"
+            MACOS_VERSION="${MACOS_VERSION:-15}"
+            BAKE="${{ github.event.inputs.bake_recovery }}"
+            BAKE="${BAKE:-Y}"
+            echo "MACOS_VERSION=${MACOS_VERSION}" >> "$ARGS_FILE"
+            echo "BAKE_RECOVERY=${BAKE}" >> "$ARGS_FILE"
           fi
 
           if [ "${{ matrix.target }}" = "windows" ]; then
@@ -194,12 +319,16 @@ jobs:
           rm -f "$ARGS_FILE"
 
       - name: Build and push
+        if: steps.gate.outputs.run == 'true'
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context }}
+          # The context is the repository root so the shared hooks and the
+          # vmguard sources are reachable from every image.
+          context: .
+          file: ./images/${{ matrix.target }}/Dockerfile
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ steps.publish.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: ${{ steps.args.outputs.build_args }}
@@ -209,24 +338,28 @@ jobs:
       # Print docker pull commands directly into the workflow run summary so
       # you don't need to dig into ghcr.io to find the image ref.
       - name: Job summary
-        if: success() && github.event_name != 'pull_request'
+        if: always() && steps.gate.outputs.run == 'true'
         run: |
           {
             echo "### \`${{ matrix.target }}\` image"
             echo
-            echo "Pushed tags:"
-            echo '```'
-            echo "${{ steps.meta.outputs.tags }}"
-            echo '```'
-            echo
-            echo "Pull:"
-            echo '```bash'
-            echo "docker pull ${{ steps.img.outputs.image }}:latest"
-            echo '```'
-            echo
-            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+            if [ "${{ steps.publish.outputs.push }}" = "true" ]; then
+              echo "Pushed tags:"
+              echo '```'
+              echo "${{ steps.meta.outputs.tags }}"
+              echo '```'
+              echo
+              echo "Pull:"
+              echo '```bash'
+              echo "docker pull ${{ steps.img.outputs.image }}:latest"
+              echo '```'
+              echo
+              echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+            else
+              echo "Built without publishing (not the default branch)."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Disk space after build
-        if: always()
+        if: always() && steps.gate.outputs.run == 'true'
         run: df -h /
