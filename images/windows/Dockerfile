@@ -8,24 +8,39 @@
 # resolves them dynamically from dockur/windows' src/define.sh. For local
 # builds, pass them explicitly:
 #
-#   docker build \
+#   docker build -f images/windows/Dockerfile \
 #     --build-arg WIN_ISO_URL=https://... \
 #     --build-arg WIN_ISO_SHA256=<hex> \
-#     -t windows-vm ./images/windows
+#     -t windows-vm .
 #
 # Find URL+hash for any Win version in:
 # https://github.com/dockur/windows/blob/master/src/define.sh (function getMido)
+#
+# The build context is the repository root, so the shared hooks and vmguard
+# sources are reachable.
 
-ARG DOCKURR_WINDOWS_TAG=latest
+# Base images are pinned by digest: a floating tag would let an upstream push
+# change what these images contain without a commit here. Dependabot bumps the
+# digests; see .github/dependabot.yml.
+
 ARG WIN_ISO_URL
 ARG WIN_ISO_SHA256
 # Set to "Y" to fail the build on SHA mismatch (default: warn and continue)
 ARG WIN_ISO_STRICT_VERIFY=N
 
 ############################################################
-# Stage 1: download + verify the ISO
+# Stage 1: the network policy enforcer (no dependencies, no network needed)
 ############################################################
-FROM debian:trixie-slim AS iso
+FROM golang:1.24-alpine@sha256:8bee1901f1e530bfb4a7850aa7a479d17ae3a18beb6e09064ed54cfd245b7191 AS vmguard
+
+WORKDIR /src
+COPY shared/vmguard/ ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/vmguard .
+
+############################################################
+# Stage 2: download + verify the ISO
+############################################################
+FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132 AS iso
 
 ARG WIN_ISO_URL
 ARG WIN_ISO_SHA256
@@ -104,9 +119,9 @@ RUN set -eu; \
     fi
 
 ############################################################
-# Stage 2: final image
+# Stage 3: final image
 ############################################################
-FROM dockurr/windows:${DOCKURR_WINDOWS_TAG}
+FROM dockurr/windows:latest@sha256:0cff9eb0e7aee9953e55bc682852ca4fdca233145a58ae1ec94f0b0c01a2ed30
 
 # Bring the verified ISO into the final image. dockurr/windows' install.sh
 # auto-detects /custom.iso at runtime and skips the mido download path.
@@ -116,12 +131,32 @@ COPY --from=iso /custom.iso /custom.iso
 # dockurr/windows already contains a FirstLogonCommand that auto-runs
 # C:\OEM\install.bat on first user logon, so just dropping files here is
 # enough — no need to override the answer file.
-COPY oem/ /oem/
+COPY images/windows/oem/ /oem/
+
+# --- shared additions ------------------------------------------------------
+# dockurr/windows is built on qemux/qemu and keeps its /run/start.sh and
+# /run/network.sh, so the same hooks apply here.
+COPY --from=vmguard /out/vmguard /usr/local/bin/vmguard
+
+COPY --chmod=755 shared/hooks/start.sh    /run/start.sh
+COPY --chmod=755 shared/hooks/watchdog.sh /run/watchdog.sh
+COPY --chmod=755 shared/hooks/guard.sh    /run/guard.sh
+
+RUN test -f /run/network.sh || { echo "base image has no /run/network.sh" >&2; exit 1; }; \
+    mv /run/network.sh /run/network.upstream.sh
+COPY --chmod=755 shared/hooks/network.sh /run/network.sh
+# ---------------------------------------------------------------------------
 
 ENV VERSION="11"
 ENV RAM_SIZE="4G"
 ENV CPU_CORES="2"
 ENV DISK_SIZE="64G"
+
+# Userspace networking by default: no NET_ADMIN, no /dev/net/tun, and the only
+# mode vmguard can enforce a policy on.
+ENV NETWORK="passt"
+ENV DNSMASQ_DISABLE="Y"
+
 # USERNAME/PASSWORD intentionally not set here — dockurr/windows defaults
 # are Docker/admin (from its win11x64.xml unattend file). Override at run
 # time with `-e USERNAME=... -e PASSWORD=...` if needed.

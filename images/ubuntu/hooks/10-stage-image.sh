@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Startup hook for the pre-baked Ubuntu image.
+# Image hook for the pre-baked Ubuntu image, sourced from /run/start.sh before
+# the base image's own install/disk scripts.
 #
-# qemux/qemu sources this file before its own install/disk scripts. We use the
-# hook to copy the baked cloud image into persistent storage and to grow that
-# boot image when DISK_SIZE/BOOT_DISK_SIZE is increased at container start.
+# It copies the baked cloud image into persistent storage on the first run and
+# grows that boot image when DISK_SIZE/BOOT_DISK_SIZE is increased at container
+# start.
 
 set -Eeuo pipefail
 
@@ -81,11 +82,15 @@ resize_boot_disk() {
 
 mkdir -p "${STORAGE}"
 
-if [ ! -f "${DEST}" ]; then
-    if [ -f "${BAKED}" ]; then
+if [ ! -s "${DEST}" ]; then
+    if [ -s "${BAKED}" ]; then
         echo "[start.sh] First run detected, staging baked qcow2 into ${DEST}..."
-        cp -f "${BAKED}" "${DEST}"
+        # Publish under a temporary name first: a copy interrupted half way
+        # would otherwise look like a complete disk on the next start.
+        rm -f "${DEST}.tmp"
+        cp -f "${BAKED}" "${DEST}.tmp"
         sync
+        mv -f "${DEST}.tmp" "${DEST}"
         echo "[start.sh] Staged $(du -h "${DEST}" | awk '{print $1}') of qcow2 to ${DEST}."
     else
         echo "[start.sh] No baked qcow2 found at ${BAKED}, falling back to BOOT env."
