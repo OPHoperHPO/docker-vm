@@ -34,7 +34,7 @@ ARG BAKE_RECOVERY=auto
 ############################################################
 # Stage 1: the network policy enforcer (no dependencies, no network needed)
 ############################################################
-FROM golang:1.24-alpine@sha256:8bee1901f1e530bfb4a7850aa7a479d17ae3a18beb6e09064ed54cfd245b7191 AS vmguard
+FROM golang:1.27-alpine@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS vmguard
 
 WORKDIR /src
 COPY shared/vmguard/ ./
