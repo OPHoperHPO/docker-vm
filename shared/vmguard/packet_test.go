@@ -113,19 +113,32 @@ func TestDecodeTruncatedFrames(t *testing.T) {
 	}
 }
 
-func TestDecodeRejectsBadIPVersion(t *testing.T) {
+// passt dispatches on the ethertype and never reads the version nibble, so this
+// decoder must not either: a packet it refused to decode would be forwarded as
+// "not IP" while passt delivered it as ordinary IPv4.
+func TestDecodeIgnoresTheIPVersionNibble(t *testing.T) {
 	frame := tcpSyn(t, "20.20.20.21", "8.8.8.8", 443)
-	frame[14] = 0x35 // version 3, IHL 5
-	if p := decode(frame); p.ip {
-		t.Fatal("frame with IP version 3 was accepted as IPv4")
+	frame[14] = 0x55 // version 5, IHL 5
+
+	p := decode(frame)
+	if !p.ip || p.malformed {
+		t.Fatalf("ip=%v malformed=%v, want the packet decoded as IPv4", p.ip, p.malformed)
+	}
+	if p.dst.String() != "8.8.8.8" || p.dstPort != 443 {
+		t.Errorf("decoded %s:%d, want 8.8.8.8:443", p.dst, p.dstPort)
 	}
 }
 
 func TestDecodeRejectsShortIHL(t *testing.T) {
 	frame := tcpSyn(t, "20.20.20.21", "8.8.8.8", 443)
 	frame[14] = 0x43 // version 4, IHL 3 (below the 5-word minimum)
-	if p := decode(frame); p.ip {
+
+	p := decode(frame)
+	if p.ip {
 		t.Fatal("frame with an undersized IHL was accepted")
+	}
+	if !p.malformed {
+		t.Fatal("an undecodable IPv4 frame was not flagged, so it would be forwarded")
 	}
 }
 

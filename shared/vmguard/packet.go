@@ -34,9 +34,10 @@ type packet struct {
 	l3Off     int    // offset of the IP header inside frame
 	l4Off     int    // offset of the transport header, 0 when unavailable
 
-	ip       bool // frame carries IPv4 or IPv6
-	v6       bool
-	src, dst netip.Addr
+	ip        bool // frame carries IPv4 or IPv6
+	v6        bool
+	malformed bool // an IP ethertype whose headers could not be resolved
+	src, dst  netip.Addr
 
 	proto     uint8
 	hasPorts  bool // transport header was present and complete
@@ -95,13 +96,17 @@ func decode(frame []byte) *packet {
 func (p *packet) decodeIPv4() {
 	b := p.frame[p.l3Off:]
 	if len(b) < 20 {
+		p.malformed = true
 		return
 	}
-	if b[0]>>4 != 4 {
-		return
-	}
+
+	// The version nibble is deliberately not checked. passt dispatches on the
+	// ethertype alone and never looks at it, so refusing to decode a packet
+	// whose nibble says something other than 4 would leave vmguard blind to a
+	// frame passt still treats as ordinary IPv4.
 	ihl := int(b[0]&0x0f) * 4
 	if ihl < 20 || len(b) < ihl {
+		p.malformed = true
 		return
 	}
 
@@ -131,11 +136,12 @@ func (p *packet) decodeIPv4() {
 func (p *packet) decodeIPv6() {
 	b := p.frame[p.l3Off:]
 	if len(b) < 40 {
+		p.malformed = true
 		return
 	}
-	if b[0]>>4 != 6 {
-		return
-	}
+
+	// As in decodeIPv4: the ethertype already chose the family, and passt does
+	// not check the version nibble either.
 
 	p.ip = true
 	p.v6 = true
@@ -152,24 +158,28 @@ func (p *packet) decodeIPv6() {
 	end := 40 + payLen
 
 	// Walk the extension header chain to reach the transport header.
-	for i := 0; i < 8; i++ {
+	//
+	// Only the headers where this walk and passt's agree byte for byte are
+	// followed. passt treats a wider set as extension headers (its
+	// IPV6_NH_OPT covers 50, 51, 139, 140, 253 and 254 as well) and advances
+	// over all of them with the same length rule, which does not match how
+	// those headers are actually encoded. Rather than guess which of the two
+	// readings a packet will get, a chain containing one of them is refused:
+	// the alternative is a packet whose ports vmguard reads from one offset
+	// and passt from another.
+	for i := 0; i < 16; i++ {
 		switch next {
 		case 0, 43, 60, 135: // hop-by-hop, routing, destination options, mobility
 			if off+2 > len(b) {
+				p.malformed = true
 				return
 			}
 			hdrLen := (int(b[off+1]) + 1) * 8
 			next = b[off]
 			off += hdrLen
-		case 51: // authentication header (length in 4-byte units, minus 2)
-			if off+2 > len(b) {
-				return
-			}
-			hdrLen := (int(b[off+1]) + 2) * 4
-			next = b[off]
-			off += hdrLen
 		case 44: // fragment header
 			if off+8 > len(b) {
+				p.malformed = true
 				return
 			}
 			fragField := binary.BigEndian.Uint16(b[off+2 : off+4])
@@ -181,11 +191,16 @@ func (p *packet) decodeIPv6() {
 				p.fragment = true
 				return
 			}
-		case 59: // no next header
+		case 50, 51, 139, 140, 253, 254: // read differently by passt
+			p.malformed = true
+			return
+		case 59: // no next header: nothing follows, judge it by address
+			p.proto = next
 			return
 		default:
 			p.proto = next
 			if off > len(b) || off >= end {
+				p.malformed = true
 				return
 			}
 			p.l4Off = p.l3Off + off
@@ -193,9 +208,14 @@ func (p *packet) decodeIPv6() {
 			return
 		}
 		if off >= len(b) {
+			p.malformed = true
 			return
 		}
 	}
+
+	// A chain this long is not something a real stack produces, and passt walks
+	// it without a limit; stopping here without a verdict would be a blind spot.
+	p.malformed = true
 }
 
 // decodeTransport reads ports (and TCP state needed for a RST) from the

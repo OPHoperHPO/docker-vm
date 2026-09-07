@@ -147,10 +147,25 @@ func (f *filter) trackedFlows() int {
 
 // inspect returns the verdict for one decoded frame.
 func (f *filter) inspect(p *packet, dir direction) verdict {
-	if !p.ip {
-		// ARP and other L2 control traffic is what makes the link usable at
-		// all; the ACL operates on IP.
-		return verdict{act: actionAllow, reason: "non-ip"}
+
+	// What vmguard could not read, it must not forward. passt dispatches on the
+	// ethertype and is far more forgiving about the headers behind it, so a
+	// frame this decoder gives up on is not "harmless non-IP traffic" — it is a
+	// packet passt may well deliver to the very destination the rules forbid.
+	switch p.etherType {
+	case ethTypeIPv4, ethTypeIPv6:
+		if !p.ip || p.malformed {
+			return verdict{act: actionDeny, reason: "undecodable"}
+		}
+	case ethTypeARP:
+		// The link cannot come up without it, and it carries no L3 destination
+		// for the ACL to judge.
+		return verdict{act: actionAllow, reason: "arp"}
+	default:
+		// passt handles ARP, IPv4 and IPv6 and drops the rest, so denying here
+		// costs nothing and keeps "undecidable means denied" true of every
+		// frame that reaches this point.
+		return verdict{act: actionDeny, reason: "unknown-ethertype"}
 	}
 
 	// Refused before anything else: a rule that constrains ports cannot decide a

@@ -364,3 +364,66 @@ func TestTruncatedFirstFragmentIsDenied(t *testing.T) {
 		t.Errorf("a normal fragmented datagram was denied (%s)", v.reason)
 	}
 }
+
+// Anything this decoder cannot resolve must be denied, not waved through as
+// "non-IP". passt is far more forgiving about the headers behind an ethertype,
+// so a frame vmguard gives up on is one passt may still deliver.
+func TestUndecodableFramesAreDenied(t *testing.T) {
+	cfg := testConfig(t)
+	f := buildFilter(t, cfg, map[string]string{"NET_PRESET": "isolated"})
+
+	t.Run("version nibble is not a way out", func(t *testing.T) {
+		frame := tcpSyn(t, "20.20.20.21", "8.8.8.8", 443)
+		frame[14] = 0x55 // version 5: passt still reads this as IPv4
+		if v := f.inspect(decode(frame), egress); v.act != actionDeny {
+			t.Fatalf("verdict = %s (%s), want deny", v.act, v.reason)
+		}
+	})
+
+	t.Run("truncated IPv4 header", func(t *testing.T) {
+		frame := tcpSyn(t, "20.20.20.21", "8.8.8.8", 443)
+		if v := f.inspect(decode(frame[:20]), egress); v.act != actionDeny {
+			t.Fatalf("verdict = %s (%s), want deny", v.act, v.reason)
+		}
+	})
+
+	t.Run("IPv6 chain passt reads differently", func(t *testing.T) {
+		// Next header 253 is an extension header to passt and the transport
+		// protocol here, so the two would read the ports from different offsets.
+		frame := buildFrame(t, frameOpts{
+			src: "fd00::21", dst: "2001:db8::1", proto: protoTCP,
+			srcPort: 45000, dstPort: 22, tcpFlags: tcpFlagSYN,
+			v6ExtHeaders: []byte{}, v6ExtNext: 253,
+		})
+		frame[20] = 253 // next header of the fixed IPv6 header
+		if v := f.inspect(decode(frame), egress); v.act != actionDeny {
+			t.Fatalf("verdict = %s (%s), want deny", v.act, v.reason)
+		}
+	})
+
+	t.Run("more extension headers than the walk follows", func(t *testing.T) {
+		var ext []byte
+		for i := 0; i < 17; i++ {
+			ext = append(ext, 60, 0, 0, 0, 0, 0, 0, 0) // destination options
+		}
+		ext[len(ext)-8] = protoTCP
+		frame := buildFrame(t, frameOpts{
+			src: "fd00::21", dst: "2001:db8::1", proto: protoTCP,
+			srcPort: 45000, dstPort: 22, tcpFlags: tcpFlagSYN,
+			v6ExtHeaders: ext, v6ExtNext: 60,
+		})
+		if v := f.inspect(decode(frame), egress); v.act != actionDeny {
+			t.Fatalf("verdict = %s (%s), want deny", v.act, v.reason)
+		}
+	})
+
+	t.Run("ARP still passes", func(t *testing.T) {
+		arp := make([]byte, 60)
+		copy(arp[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+		copy(arp[6:12], guestMAC)
+		arp[12], arp[13] = 0x08, 0x06
+		if v := f.inspect(decode(arp), egress); v.act != actionAllow {
+			t.Fatalf("ARP verdict = %s (%s); the link cannot come up without it", v.act, v.reason)
+		}
+	})
+}
