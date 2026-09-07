@@ -88,30 +88,56 @@ if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
   exit 66
 fi
 
-echo "Downloading $URL"
+# Apple hands back a plain-http CDN URL. The image ends up baked into a
+# published container image and carries no signature we can check, so anyone on
+# the path could swap it — and the AssetToken would travel in the clear too.
+# The same CDN serves https, so upgrade the scheme and only fall back if Apple's
+# CDN genuinely refuses TLS.
+download() {
 
-# The CDN accepts range requests, so several connections cut a ~700 MB
-# download from tens of minutes to a couple on a CI runner.
-aria2c \
-  --max-connection-per-server=8 \
-  --split=8 \
-  --min-split-size=1M \
-  --max-tries=5 \
-  --retry-wait=10 \
-  --connect-timeout=30 \
-  --timeout=60 \
-  --auto-file-renaming=false \
-  --allow-overwrite=true \
-  --check-certificate=true \
-  --console-log-level=warn \
-  --summary-interval=30 \
-  --header "Host: oscdn.apple.com" \
-  --header "Connection: close" \
-  --header "Cookie: AssetToken=${TOKEN}" \
-  --user-agent "InternetRecovery/1.0" \
-  --dir="$(dirname "$OUTPUT")" \
-  --out="$(basename "$OUTPUT")" \
-  "$URL"
+  local url="$1"
+
+  echo "Downloading $url"
+
+  # The CDN accepts range requests, so several connections cut a ~850 MB
+  # download from tens of minutes to a couple on a CI runner.
+  aria2c \
+    --max-connection-per-server=8 \
+    --split=8 \
+    --min-split-size=1M \
+    --max-tries=5 \
+    --retry-wait=10 \
+    --connect-timeout=30 \
+    --timeout=60 \
+    --auto-file-renaming=false \
+    --allow-overwrite=true \
+    --check-certificate=true \
+    --console-log-level=warn \
+    --summary-interval=30 \
+    --header "Host: oscdn.apple.com" \
+    --header "Connection: close" \
+    --header "Cookie: AssetToken=${TOKEN}" \
+    --user-agent "InternetRecovery/1.0" \
+    --dir="$(dirname "$OUTPUT")" \
+    --out="$(basename "$OUTPUT")" \
+    "$url"
+}
+
+SECURE_URL="$URL"
+case "$URL" in
+  http://*) SECURE_URL="https://${URL#http://}" ;;
+esac
+
+if [ "$SECURE_URL" != "$URL" ]; then
+  if ! download "$SECURE_URL"; then
+    echo "WARNING: the CDN refused TLS; retrying over plain http." >&2
+    echo "WARNING: the recovery image is then unauthenticated in transit." >&2
+    rm -f -- "$OUTPUT" "$OUTPUT.aria2"
+    download "$URL"
+  fi
+else
+  download "$URL"
+fi
 
 SIZE=$(stat -c%s "$OUTPUT")
 echo "Downloaded $(numfmt --to=iec --suffix=B "$SIZE")."
