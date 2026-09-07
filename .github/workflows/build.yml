@@ -40,9 +40,9 @@ on:
         required: false
         default: 'noble'
       macos_version:
-        description: 'macOS version to bake (15/sequoia, 14/sonoma, 13/ventura, ...)'
+        description: 'macOS version to bake (26/tahoe, 15/sequoia, 14/sonoma, 13/ventura, ...)'
         required: false
-        default: '15'
+        default: '26'
       bake_recovery:
         description: 'Bake the macOS recovery image at build time: auto (warn on refusal), Y (fail), N (never)'
         required: false
@@ -255,7 +255,7 @@ jobs:
 
           if [ "${{ matrix.target }}" = "macos" ]; then
             MACOS_VERSION="${{ github.event.inputs.macos_version }}"
-            MACOS_VERSION="${MACOS_VERSION:-15}"
+            MACOS_VERSION="${MACOS_VERSION:-26}"
             BAKE="${{ github.event.inputs.bake_recovery }}"
             BAKE="${BAKE:-auto}"
             echo "MACOS_VERSION=${MACOS_VERSION}" >> "$ARGS_FILE"

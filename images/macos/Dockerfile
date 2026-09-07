@@ -28,7 +28,9 @@
 # change what these images contain without a commit here. Dependabot bumps the
 # digests; see .github/dependabot.yml.
 
-ARG MACOS_VERSION=15
+# macOS 26 (Tahoe) is the last release Apple builds for Intel, and every
+# machine here is an emulated Intel Mac, so it is as new as this can go.
+ARG MACOS_VERSION=26
 ARG BAKE_RECOVERY=auto
 
 ############################################################

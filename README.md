@@ -7,7 +7,7 @@
 |---|---|---|
 | `ghcr.io/<you>/<repo>-ubuntu-24.04` | Ubuntu 24.04 cloud image | ~2 GB |
 | `ghcr.io/<you>/<repo>-windows-11` | Windows 11 IoT LTSC | ~6 GB |
-| `ghcr.io/<you>/<repo>-macos` | macOS 15 (recovery внутри) | ~1.5 GB |
+| `ghcr.io/<you>/<repo>-macos` | macOS 26 (recovery внутри) | ~1.5 GB |
 
 Размеры распакованные — почти целиком это вшитый образ ОС. Первый старт не
 ходит в сеть за операционкой: qcow2, ISO и recovery уже лежат внутри.
@@ -152,11 +152,18 @@ Setup Assistant не работают без GUI. Контейнер печат�
 при первом запуске. Всё установленное живёт в `/storage` и переживает
 перезапуски.
 
-Версия задаётся на сборке:
+По умолчанию вшивается **macOS 26 (Tahoe)** — последний релиз, для которого
+Apple вообще собирает Intel-версию, а VM здесь всегда эмулирует Intel-мак.
+Другая версия задаётся на сборке:
 
 ```bash
-docker build -f images/macos/Dockerfile --build-arg MACOS_VERSION=14 -t macos-vm .
+docker build -f images/macos/Dockerfile --build-arg MACOS_VERSION=15 -t macos-vm .
 ```
+
+Принимаются и имена, и номера: `tahoe`/`26`, `sequoia`/`15`, `sonoma`/`14`,
+`ventura`/`13`, `monterey`/`12`, `bigsur`/`11`, `catalina`/`10`. Чем свежее
+релиз, тем меньше он обкатан на загрузчике `dockurr/macos`; если Tahoe не
+встаёт, откатывайся на 15.
 
 Apple пускает на `osrecovery.apple.com` не из всякой сети. Что делать в этом
 случае, выбирает `--build-arg BAKE_RECOVERY`:
@@ -277,7 +284,7 @@ Workflow `Build VM images`:
 Ручной запуск с переопределениями:
 
 ```bash
-gh workflow run "Build VM images" -f targets=macos -f macos_version=14
+gh workflow run "Build VM images" -f targets=macos -f macos_version=15
 gh workflow run "Build VM images" -f targets=windows \
   -f win_iso_url='https://software-static.download.prss.microsoft.com/.../...iso' \
   -f win_iso_sha256='<sha256>'
