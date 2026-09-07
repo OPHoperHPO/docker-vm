@@ -1,72 +1,30 @@
 # Pre-baked VM Docker images
 
-Три Docker-образа с уже встроенной ОС и init-скриптами. Под капотом —
-QEMU/KVM (`qemux/qemu`, `dockurr/windows`, `dockurr/macos`).
+Три Docker-образа с уже встроенной ОС и init-скриптами. Под капотом — QEMU/KVM
+(`qemux/qemu`, `dockurr/windows`, `dockurr/macos`).
 
 | Образ | ОС | Размер |
 |---|---|---|
-| `ghcr.io/<you>/<repo>-ubuntu-24.04` | Ubuntu 24.04 cloud image | ~1 GB |
-| `ghcr.io/<you>/<repo>-windows-11` | Windows 11 IoT LTSC | ~6.3 GB |
-| `ghcr.io/<you>/<repo>-macos` | macOS (recovery вшит в образ) | ~1.5 GB |
+| `ghcr.io/<you>/<repo>-ubuntu-24.04` | Ubuntu 24.04 cloud image | ~2 GB |
+| `ghcr.io/<you>/<repo>-windows-11` | Windows 11 IoT LTSC | ~6 GB |
+| `ghcr.io/<you>/<repo>-macos` | macOS 15 (recovery внутри) | ~1.5 GB |
 
-Никаких скачиваний при первом старте — ISO/qcow2/dmg уже внутри образа.
+Размеры распакованные — почти целиком это вшитый образ ОС. Первый старт не
+ходит в сеть за операционкой: qcow2, ISO и recovery уже лежат внутри.
 
 Плюс к этому:
 
 * **[Ограничение доступа VM к сети](docs/network.md)** — правила по подсетям и
-  портам, которые применяются снаружи гостя, без `NET_ADMIN` и без iptables на
-  хосте.
+  портам, применяются снаружи гостя, без `NET_ADMIN` и без iptables на хосте.
 * **Не залипает после падения passt** — сторож перезапускает контейнер, если
   сетевой хелпер умер, вместо VM без сети, которую надо заметить руками.
 * Лимит открытых файлов поднимается сам, до того как стартует passt.
 
 ---
 
-## Структура
-
-```
-.
-├── .github/workflows/build.yml      # CI: matrix-сборка → push в GHCR
-├── docs/network.md                  # ⇐ правила доступа к сети
-├── examples/compose.yml             # готовый compose на три VM
-├── shared/
-│   ├── hooks/                       # общие для всех образов startup-хуки
-│   │   ├── start.sh                 #   лимит fd + /run/hooks.d/*
-│   │   ├── network.sh               #   обёртка над сетью базового образа
-│   │   ├── guard.sh                 #   подключение vmguard
-│   │   └── watchdog.sh              #   сторож за passt/vmguard
-│   └── vmguard/                     # фильтр трафика (Go, без зависимостей)
-└── images/
-    ├── ubuntu/
-    │   ├── Dockerfile               # Бакает cloud-image и cloud-init seed
-    │   ├── hooks/10-stage-image.sh  # копирует qcow2 в /storage на 1-м запуске
-    │   └── cloud-init/
-    │       ├── user-data            # ⇐ редактируй это
-    │       └── meta-data
-    ├── windows/
-    │   ├── Dockerfile               # Бакает Win11 ISO + /oem
-    │   └── oem/
-    │       ├── install.bat          # ⇐ запускается на 1-м логине
-    │       └── firstboot.ps1        # ⇐ сюда логику инициализации
-    └── macos/
-        ├── Dockerfile               # Бакает recovery-образ Apple
-        ├── fetch-recovery.sh        # скачивание recovery на сборке
-        ├── verify-recovery.py       # сверка с подписанным chunklist'ом Apple
-        └── hooks/10-macos.sh
-```
-
-Все Dockerfile собираются **из корня репозитория**, потому что используют
-общий `shared/`:
-
-```bash
-docker build -f images/ubuntu/Dockerfile -t ubuntu-vm .
-```
-
----
-
 ## Запуск
 
-Минимум привилегий: единственное обязательное устройство — `/dev/kvm`.
+Единственное обязательное устройство — `/dev/kvm`.
 
 ```yaml
 services:
@@ -74,40 +32,41 @@ services:
     image: ghcr.io/<you>/<repo>-ubuntu-24.04:latest
     restart: always
     stop_grace_period: 2m
-    devices:
-      - /dev/kvm
+    devices: [ /dev/kvm ]
     volumes:
-      - ./ubuntu-storage:/storage
+      - ./storage/ubuntu:/storage
     ports:
       - 127.0.0.1:8006:8006     # web-консоль
-      - 127.0.0.1:2222:22       # ssh в VM
+      - 127.0.0.1:2222:22       # ssh внутрь VM
     environment:
-      CPU_CORES: 8
-      RAM_SIZE: 16G
-      DISK_SIZE: 150G
+      CPU_CORES: 4
+      RAM_SIZE: 8G
+      DISK_SIZE: 64G
       USER_PORTS: "22"          # какие порты VM пробросить наружу
+      NET_PRESET: internet      # интернет можно, приватные сети — нет
 ```
 
-Полный пример на три VM — [`examples/compose.yml`](examples/compose.yml).
+Готовый пример на все три VM — [`examples/compose.yml`](examples/compose.yml).
 
-`NETWORK=passt` и `DNSMASQ_DISABLE=Y` — уже дефолт образов, отдельно задавать
-не нужно. `ulimits` в compose тоже не нужен: soft-лимит поднимается сам до
-hard-лимита при старте.
+`NETWORK=passt` и `DNSMASQ_DISABLE=Y` уже дефолт образов, задавать не нужно.
+`ulimits` в compose тоже не нужен: soft-лимит поднимается сам до hard-лимита.
 
-### docker run
+### Как заходить внутрь
 
-```bash
-docker run -d --name ubuntu-vm \
-  --restart=always \
-  --device=/dev/kvm \
-  -p 127.0.0.1:8006:8006 \
-  -v ./ubuntu-storage:/storage \
-  ghcr.io/<you>/<repo>-ubuntu-24.04:latest
-```
+| VM | Доступ | Учётка |
+|---|---|---|
+| Ubuntu | SSH на проброшенный порт | `ubuntu` / `ubuntu` |
+| Windows | RDP на 3389 | `Docker` / `admin` |
+| macOS | web-консоль или VNC 5900 | заводится при установке |
 
-Первый запуск Ubuntu — ~30 секунд до готовности cloud-init.
-Первый запуск Windows — ~10–15 минут unattended-инсталляции (с диска, не из сети).
-SSH/RDP по умолчанию: `ubuntu/ubuntu`, `Docker/admin`.
+**SSH из коробки есть только у Ubuntu.** В Windows его нет вообще, в macOS
+Remote Login выключен, пока не включишь его в System Settings.
+
+У всех трёх есть web-консоль на порту 8006 внутри контейнера — она показывает
+экран VM и нужна тогда, когда сети внутри ещё нет.
+
+Первый старт: Ubuntu — меньше минуты до готовности cloud-init, Windows —
+10–15 минут unattended-установки с вшитого ISO, macOS — см. ниже.
 
 ---
 
@@ -115,7 +74,7 @@ SSH/RDP по умолчанию: `ubuntu/ubuntu`, `Docker/admin`.
 
 ```yaml
 environment:
-  NET_PRESET: internet        # интернет можно, домашнюю сеть и соседей — нет
+  NET_PRESET: internet        # всё, кроме приватных сетей и cloud-metadata
 ```
 
 ```yaml
@@ -127,14 +86,16 @@ environment:
     tcp:10.10.0.5:5432
 ```
 
-Правила применяются между QEMU и passt, то есть **снаружи гостевой ОС**:
-внутри VM их не видно и отключить их оттуда нельзя. Хосту не нужны ни
-`NET_ADMIN`, ни `/dev/net/tun`, ни правила файрвола.
+Правила применяются между QEMU и passt, то есть **снаружи гостевой ОС**: внутри
+VM их не видно и отключить их оттуда нельзя. Хосту не нужны ни `NET_ADMIN`, ни
+`/dev/net/tun`, ни правила файрвола.
 
-Заблокированное TCP-соединение обрывается сразу (`RST`), а не висит до
-таймаута. Заблокированные потоки видны в логах контейнера и в JSON-статусе.
+Правила описывают, кому можно *начинать* разговор: ответы на уже разрешённое
+соединение проходят, поэтому проброшенный внутрь SSH работает и при запрете
+приватных сетей. Заблокированное TCP-соединение обрывается сразу (`RST`), а не
+висит до таймаута; заблокированные потоки видны в логах контейнера.
 
-Подробности, синтаксис, пресеты, живая перезагрузка правил из файла —
+Синтаксис, пресеты, файл правил с перечиткой на лету, статус-эндпоинт —
 [`docs/network.md`](docs/network.md).
 
 ---
@@ -143,7 +104,7 @@ environment:
 
 ### Ubuntu
 
-Редактируй `images/ubuntu/cloud-init/user-data`. Релевантные секции:
+Редактируй `images/ubuntu/cloud-init/user-data`:
 
 ```yaml
 runcmd:
@@ -157,49 +118,44 @@ write_files:
       # ВОТ СЮДА твою логику
 ```
 
-cloud-init выполнится **один раз** на свежем диске. Чтобы пере-запустить —
-удали `./ubuntu-storage` и перезапусти контейнер.
+cloud-init выполняется **один раз** на свежем диске. Чтобы прогнать заново —
+удали каталог storage и перезапусти контейнер.
 
 ### Windows
 
 Редактируй `images/windows/oem/firstboot.ps1` (PowerShell) или
-`images/windows/oem/install.bat`. Файлы попадают в `C:\OEM\` внутри Windows,
-`install.bat` запускается автоматически на первом логине через встроенный
-FirstLogonCommand в дефолтном unattend XML.
+`images/windows/oem/install.bat`. Файлы попадают в `C:\OEM\`, `install.bat`
+запускается автоматически на первом логине — за это отвечает FirstLogonCommand
+в дефолтном unattend XML, свой писать не нужно.
 
 Логи — `C:\OEM\install.log`.
 
-После любого изменения init-скриптов нужно пересобрать образ
-(workflow триггернётся на push) и удалить storage-volume для re-run.
+После правки init-скриптов пересобери образ и удали storage, иначе они не
+отработают повторно.
 
 ### macOS
 
-Recovery-образ Apple скачивается **на сборке**, сверяется с подписанным
-chunklist'ом Apple (SHA-256 по каждому куску, подпись проверяется её же ключом
-EFI ROM) и лежит внутри контейнера; при первом старте он раскладывается в
-`/storage/<версия>/base.dmg`, поэтому установщик поднимается сразу — без
-ожидания серверов Apple.
+Recovery-образ Apple скачивается на сборке и сверяется с подписанным
+chunklist'ом Apple: SHA-256 по каждому куску, подпись проверяется ключом Apple
+EFI ROM. При первом старте он раскладывается в `/storage/<версия>/base.dmg`,
+поэтому установщик поднимается сразу.
 
-Дальше несколько шагов делаются в web-консоли (порт 8006) руками:
+Дальше три шага делаются в web-консоли руками:
 
 1. выбрать язык;
 2. **Disk Utility** → выбрать самый большой диск QEMU → **Erase**
    (имя `Macintosh HD`, формат `APFS`, схема `GUID Partition Map`);
 3. выйти из Disk Utility → **Reinstall macOS** → дальше по мастеру.
 
-Unattended-режима у установщика macOS не существует — ни `startosinstall`,
-ни Setup Assistant не умеют работать без GUI, поэтому эти шаги остаются
-ручными во всех проектах такого рода. Контейнер печатает эту инструкцию
-в лог при первом запуске.
-
-Всё, что установлено, живёт в примонтированном `/storage` и переживает
+Unattended-режима у установщика macOS не существует: ни `startosinstall`, ни
+Setup Assistant не работают без GUI. Контейнер печатает эту инструкцию в лог
+при первом запуске. Всё установленное живёт в `/storage` и переживает
 перезапуски.
 
-Версия macOS задаётся на сборке:
+Версия задаётся на сборке:
 
 ```bash
-docker build -f images/macos/Dockerfile \
-  --build-arg MACOS_VERSION=14 -t macos-vm .
+docker build -f images/macos/Dockerfile --build-arg MACOS_VERSION=14 -t macos-vm .
 ```
 
 Apple пускает на `osrecovery.apple.com` не из всякой сети. Что делать в этом
@@ -211,7 +167,7 @@ Apple пускает на `osrecovery.apple.com` не из всякой сети
 | `Y` | вшить обязательно, иначе сборка падает |
 | `N` | не вшивать, качать при первом старте (как в оригинальном `dockurr/macos`) |
 
-В любом случае контейнер в логе при старте пишет, какой образ он использует.
+Контейнер в логе при старте пишет, какой образ он использует.
 
 macOS требует Intel-совместимый профиль CPU; на AMD-хостах образ выбирает его
 сам. Меньше 8 GB RAM и 4 ядер ставить не стоит.
@@ -230,9 +186,49 @@ macOS требует Intel-совместимый профиль CPU; на AMD-�
 Порты VM наружу: либо `USER_PORTS="22,80,443"` (явный список), либо
 `PASST_OPTS="-t all -u all"` (все).
 
-Правила доступа (`docs/network.md`) работают только в режиме `passt`. Если
-правила заданы, а режим другой — контейнер откажется стартовать, а не сделает
-вид, что ограничения действуют.
+Правила доступа работают только в режиме `passt`. Если правила заданы, а режим
+другой — контейнер откажется стартовать, а не сделает вид, что ограничения
+действуют.
+
+---
+
+## Структура
+
+```
+.
+├── .github/workflows/build.yml      # CI: сборка матрицей → push в GHCR
+├── docs/network.md                  # ⇐ правила доступа к сети
+├── examples/compose.yml             # готовый compose на три VM
+├── shared/
+│   ├── hooks/                       # общие для всех образов startup-хуки
+│   │   ├── start.sh                 #   лимит fd + /run/hooks.d/*
+│   │   ├── network.sh               #   обёртка над сетью базового образа
+│   │   ├── guard.sh                 #   подключение vmguard
+│   │   └── watchdog.sh              #   сторож за passt/vmguard
+│   └── vmguard/                     # фильтр трафика (Go, без зависимостей)
+└── images/
+    ├── ubuntu/
+    │   ├── Dockerfile               # вшивает cloud-image и cloud-init seed
+    │   ├── hooks/10-stage-image.sh  # кладёт qcow2 в /storage на 1-м запуске
+    │   └── cloud-init/user-data     # ⇐ редактируй это
+    ├── windows/
+    │   ├── Dockerfile               # вшивает Win11 ISO + /oem
+    │   └── oem/
+    │       ├── install.bat          # ⇐ запускается на 1-м логине
+    │       └── firstboot.ps1        # ⇐ сюда логику инициализации
+    └── macos/
+        ├── Dockerfile               # вшивает recovery-образ Apple
+        ├── fetch-recovery.sh        # скачивание recovery на сборке
+        ├── verify-recovery.py       # сверка с подписанным chunklist'ом Apple
+        └── hooks/10-macos.sh
+```
+
+Все Dockerfile собираются **из корня репозитория**, потому что используют
+общий `shared/`:
+
+```bash
+docker build -f images/ubuntu/Dockerfile -t ubuntu-vm .
+```
 
 ---
 
@@ -240,11 +236,11 @@ macOS требует Intel-совместимый профиль CPU; на AMD-�
 
 Workflow `Build VM images`:
 
-* собирает все три образа и **пушит в GHCR только с дефолтной ветки**;
-* на любой другой ветке и в PR собирает полностью, но ничего не публикует —
-  ветка не может залить недоделанный образ в package registry;
-* перед сборкой гоняет тесты `vmguard` — юнит-тесты, тесты с реальным `passt`
-  внутри `qemux/qemu`, `shellcheck` по хукам.
+* пушит в GHCR **только с дефолтной ветки**; на любой другой ветке и в PR
+  собирает полностью, но ничего не публикует;
+* перед сборкой гоняет тесты: `vmguard` (юнит-тесты и тесты с настоящим `passt`
+  внутри `qemux/qemu`), верификатор chunklist'а, `shellcheck` по хукам;
+* собирает коммит один раз, даже когда push и pull_request приходят вместе.
 
 Ручной запуск с переопределениями:
 
@@ -258,10 +254,12 @@ gh workflow run "Build VM images" -f targets=windows \
 Опубликовать образы из не-дефолтной ветки можно только явно:
 `-f push_images=true`.
 
-URL+hash для других редакций Windows смотри в
-[`dockur/windows/src/define.sh`](https://github.com/dockur/windows/blob/master/src/define.sh)
-(функция `getMido`). Когда дефолтный URL стухнет (Microsoft меняет билды раз
-в 3–6 месяцев), sha256 не сойдётся и CI это покажет.
+URL и хэш для других редакций Windows — в
+[`dockur/windows/src/define.sh`](https://github.com/dockur/windows/blob/master/src/define.sh),
+функция `getMido`. Учти: несовпадение SHA256 у Windows ISO по умолчанию только
+**предупреждение** в логе, а не ошибка — Microsoft переиздаёт ISO под тем же
+URL, и хэши в апстриме отстают. Чтобы сборка падала на несовпадении, собирай с
+`--build-arg WIN_ISO_STRICT_VERIFY=Y`.
 
 Permissions: репо → Settings → Actions → General → "Read and write
 permissions" для `GITHUB_TOKEN`.
@@ -271,8 +269,8 @@ permissions" для `GITHUB_TOKEN`.
 ## Требования к хосту
 
 - Linux + `/dev/kvm` (KVM включён в BIOS, ядро не блокирует).
-- ~10 GB свободного диска под Windows storage volume (sparse qcow2 64 GB),
-  ~100 GB под macOS.
+- Диски создаются разреженными, так что заявленный `DISK_SIZE` место сразу не
+  занимает: Windows после установки — около 20 GB, macOS — несколько десятков.
 - Не работает на cloud VPS без nested virt (большинство — без).
 
 Полный список env-переменных:
