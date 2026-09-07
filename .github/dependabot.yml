@@ -1,0 +1,22 @@
+# Base images are pinned by digest in images/*/Dockerfile, which keeps an
+# upstream push from silently changing what we ship — but it also means nothing
+# updates them unless something asks. That is what this file is for: Dependabot
+# opens a PR when a pinned digest moves, and CI builds it like any other change.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directories:
+      - /images/ubuntu
+      - /images/windows
+      - /images/macos
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "images"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"

@@ -24,15 +24,17 @@
 #   N               never bake; download on first start, as dockurr/macos does
 # Whichever path runs, the container says at startup which image it is using.
 
-ARG DOCKURR_MACOS_TAG=latest
-ARG GO_VERSION=1.24
+# Base images are pinned by digest: a floating tag would let an upstream push
+# change what these images contain without a commit here. Dependabot bumps the
+# digests; see .github/dependabot.yml.
+
 ARG MACOS_VERSION=15
 ARG BAKE_RECOVERY=auto
 
 ############################################################
 # Stage 1: the network policy enforcer (no dependencies, no network needed)
 ############################################################
-FROM golang:${GO_VERSION}-alpine AS vmguard
+FROM golang:1.24-alpine@sha256:8bee1901f1e530bfb4a7850aa7a479d17ae3a18beb6e09064ed54cfd245b7191 AS vmguard
 
 WORKDIR /src
 COPY shared/vmguard/ ./
@@ -41,7 +43,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/vmguard .
 ############################################################
 # Stage 2: fetch and verify the macOS recovery image
 ############################################################
-FROM debian:trixie-slim AS recovery
+FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132 AS recovery
 
 ARG MACOS_VERSION
 ARG BAKE_RECOVERY
@@ -79,7 +81,7 @@ RUN set -eu; \
 ############################################################
 # Stage 3: final image
 ############################################################
-FROM dockurr/macos:${DOCKURR_MACOS_TAG}
+FROM dockurr/macos:latest@sha256:08d1bcaac74ad44d548b7ce683b3dded083512d2a0d26416f9a620b763f8ea3d
 
 ARG MACOS_VERSION
 

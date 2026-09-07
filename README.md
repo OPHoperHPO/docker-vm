@@ -196,7 +196,9 @@ macOS требует Intel-совместимый профиль CPU; на AMD-�
 
 ```
 .
-├── .github/workflows/build.yml      # CI: сборка матрицей → push в GHCR
+├── .github/
+│   ├── workflows/build.yml          # CI: сборка матрицей → push в GHCR
+│   └── dependabot.yml               # апдейты digest'ов базовых образов
 ├── docs/network.md                  # ⇐ правила доступа к сети
 ├── examples/compose.yml             # готовый compose на три VM
 ├── shared/
@@ -209,6 +211,8 @@ macOS требует Intel-совместимый профиль CPU; на AMD-�
 └── images/
     ├── ubuntu/
     │   ├── Dockerfile               # вшивает cloud-image и cloud-init seed
+    │   ├── fetch-cloudimage.sh      # скачивание cloud-image со сверкой подписи
+    │   ├── canonical-cloudimage-key.asc
     │   ├── hooks/10-stage-image.sh  # кладёт qcow2 в /storage на 1-м запуске
     │   └── cloud-init/user-data     # ⇐ редактируй это
     ├── windows/
@@ -228,6 +232,34 @@ macOS требует Intel-совместимый профиль CPU; на AMD-�
 
 ```bash
 docker build -f images/ubuntu/Dockerfile -t ubuntu-vm .
+```
+
+---
+
+## Что попадает в образ на сборке
+
+Образы собираются с нуля из этого репозитория, и всё, что качается на сборке,
+сверяется с подписью издателя:
+
+| Что | Проверка |
+|---|---|
+| Ubuntu cloud image | SHA-256 из `SHA256SUMS` Canonical; сама `SHA256SUMS` — подписью UEC Image Automatic Signing Key (ключ лежит в репозитории) |
+| macOS recovery | подписанный chunklist Apple: SHA-256 по каждому куску, подпись — ключом Apple EFI ROM |
+| Windows ISO | SHA-256 из `dockur/windows`; по умолчанию несовпадение — предупреждение, см. ниже |
+
+Базовые образы (`qemux/qemu`, `dockurr/windows`, `dockurr/macos`, `debian`,
+`golang`) пришпилены по digest, а не по плавающему тегу: апстрим не может
+поменять содержимое сборки без коммита сюда. Digest'ы обновляет Dependabot
+([`.github/dependabot.yml`](.github/dependabot.yml)), и его PR проходит тот же
+CI, что и любой другой.
+
+Для зеркала или своего образа, рядом с которым нет `SHA256SUMS`, хэш задаётся
+явно:
+
+```bash
+docker build -f images/ubuntu/Dockerfile \
+  --build-arg UBUNTU_IMG_URL=https://example.com/my-cloudimg.img \
+  --build-arg UBUNTU_IMG_SHA256=<sha256> -t ubuntu-vm .
 ```
 
 ---
