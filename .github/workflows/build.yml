@@ -333,7 +333,7 @@ jobs:
       - name: Build and push
         if: steps.gate.outputs.run == 'true'
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           # The context is the repository root so the shared hooks and the
           # vmguard sources are reachable from every image.
