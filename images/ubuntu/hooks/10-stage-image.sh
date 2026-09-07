@@ -82,11 +82,15 @@ resize_boot_disk() {
 
 mkdir -p "${STORAGE}"
 
-if [ ! -f "${DEST}" ]; then
-    if [ -f "${BAKED}" ]; then
+if [ ! -s "${DEST}" ]; then
+    if [ -s "${BAKED}" ]; then
         echo "[start.sh] First run detected, staging baked qcow2 into ${DEST}..."
-        cp -f "${BAKED}" "${DEST}"
+        # Publish under a temporary name first: a copy interrupted half way
+        # would otherwise look like a complete disk on the next start.
+        rm -f "${DEST}.tmp"
+        cp -f "${BAKED}" "${DEST}.tmp"
         sync
+        mv -f "${DEST}.tmp" "${DEST}"
         echo "[start.sh] Staged $(du -h "${DEST}" | awk '{print $1}') of qcow2 to ${DEST}."
     else
         echo "[start.sh] No baked qcow2 found at ${BAKED}, falling back to BOOT env."

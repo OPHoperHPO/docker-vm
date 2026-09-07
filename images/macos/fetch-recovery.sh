@@ -121,17 +121,21 @@ if (( SIZE < 100000000 )); then
   exit 67
 fi
 
-# Same two checks dockur/macos performs at run time, done here so a bad image
-# never reaches a user's first boot.
 if ! qemu-img info "$OUTPUT" > /dev/null; then
   echo "ERROR: the downloaded file is not a valid disk image." >&2
   exit 68
 fi
 
-if ! 7z l -slt "$OUTPUT" 2>/dev/null | grep -Eiq \
-  '^Path = (.+[\\/])?(System[\\/]Library[\\/]CoreServices[\\/]boot\.efi|com\.apple\.recovery\.boot[\\/]boot\.efi)$'; then
-  echo "ERROR: no macOS boot loader found inside the recovery image." >&2
+# A UDIF disk image ends with a 512-byte "koly" trailer. Checking it catches a
+# truncated transfer or an error page that happened to be large enough to pass
+# the size check.
+#
+# The contents are deliberately not inspected: since Big Sur the recovery
+# volume inside is APFS, which 7z cannot read, so looking for boot.efi rejects
+# every image Apple currently serves.
+if [ "$(tail -c 512 "$OUTPUT" | head -c 4)" != "koly" ]; then
+  echo "ERROR: the download does not end with a UDIF trailer; it is truncated or not a DMG." >&2
   exit 69
 fi
 
-echo "Recovery image verified: bootable, $(numfmt --to=iec --suffix=B "$SIZE")."
+echo "Recovery image verified: $(numfmt --to=iec --suffix=B "$SIZE"), UDIF trailer present."
