@@ -50,7 +50,8 @@ QEMU/KVM (`qemux/qemu`, `dockurr/windows`, `dockurr/macos`).
     │       └── firstboot.ps1        # ⇐ сюда логику инициализации
     └── macos/
         ├── Dockerfile               # Бакает recovery-образ Apple
-        ├── fetch-recovery.sh        # скачивание и проверка recovery на сборке
+        ├── fetch-recovery.sh        # скачивание recovery на сборке
+        ├── verify-recovery.py       # сверка с подписанным chunklist'ом Apple
         └── hooks/10-macos.sh
 ```
 
@@ -173,9 +174,11 @@ FirstLogonCommand в дефолтном unattend XML.
 
 ### macOS
 
-Recovery-образ Apple скачивается и проверяется **на сборке** и лежит внутри
-контейнера; при первом старте он раскладывается в `/storage/<версия>/base.dmg`,
-поэтому установщик поднимается сразу — без ожидания серверов Apple.
+Recovery-образ Apple скачивается **на сборке**, сверяется с подписанным
+chunklist'ом Apple (SHA-256 по каждому куску, подпись проверяется её же ключом
+EFI ROM) и лежит внутри контейнера; при первом старте он раскладывается в
+`/storage/<версия>/base.dmg`, поэтому установщик поднимается сразу — без
+ожидания серверов Apple.
 
 Дальше несколько шагов делаются в web-консоли (порт 8006) руками:
 

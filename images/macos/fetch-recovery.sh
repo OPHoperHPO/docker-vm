@@ -79,8 +79,15 @@ os=latest" \
   https://osrecovery.apple.com/InstallationPayload/RecoveryImage
 
 INFO=$(tr ' ' '\n' < "$RESPONSE")
-URL=$(echo "$INFO" | grep 'oscdn' | grep 'dmg' | head -n 1 || :)
-TOKEN=$(echo "$INFO" | grep 'expires' | grep 'dmg' | head -n 1 || :)
+URL=$(echo "$INFO" | grep 'oscdn' | grep 'dmg' | grep -v 'chunklist' | head -n 1 || :)
+TOKEN=$(echo "$INFO" | grep 'expires' | grep 'dmg' | grep -v 'chunklist' | head -n 1 || :)
+
+# Apple also returns a chunklist: SHA-256 digests for every chunk of the image,
+# signed with its EFI ROM key. Both links arrive over TLS, so verifying the
+# signature and then the chunks is what makes the image trustworthy however it
+# was transferred.
+CHUNK_URL=$(echo "$INFO" | grep 'oscdn' | grep 'chunklist' | head -n 1 || :)
+CHUNK_TOKEN=$(echo "$INFO" | grep 'expires' | grep 'chunklist' | head -n 1 || :)
 
 if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
   echo "ERROR: unexpected response from Apple:" >&2
@@ -88,20 +95,18 @@ if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
   exit 66
 fi
 
-# Apple hands back a plain-http CDN URL. What it serves ends up baked into a
-# container image other people pull, and it carries no signature anyone can
-# check — the only tests below are that it is large, that qemu-img parses it and
-# that it ends in a UDIF trailer, all of which an attacker-supplied image passes.
-# Whoever sits on the path would therefore choose what macOS every user of that
-# image installs, and the AssetToken would travel in the clear on the way.
+# Apple hands back plain-http CDN links and refuses TLS on them, while what they
+# serve ends up baked into a container image other people pull. Size, qemu-img
+# and a UDIF trailer are all things an attacker-supplied image passes, so the
+# transport cannot be what this rests on: the chunklist signature is.
 #
-# The same CDN answers on 443, so the transfer is done over TLS and there is no
-# fallback: a build that cannot get the image securely must not produce one that
-# claims to have it. BAKE_RECOVERY=auto already degrades safely by skipping the
-# bake, which leaves the download to the user's own machine at first start.
+# TLS is still preferred where the CDN allows it, because it keeps the
+# AssetToken off the wire.
 download() {
 
   local url="$1"
+  local dest="$2"
+  local token="$3"
 
   echo "Downloading $url"
 
@@ -122,28 +127,65 @@ download() {
     --summary-interval=30 \
     --header "Host: oscdn.apple.com" \
     --header "Connection: close" \
-    --header "Cookie: AssetToken=${TOKEN}" \
+    --header "Cookie: AssetToken=${token}" \
     --user-agent "InternetRecovery/1.0" \
-    --dir="$(dirname "$OUTPUT")" \
-    --out="$(basename "$OUTPUT")" \
+    --dir="$(dirname "$dest")" \
+    --out="$(basename "$dest")" \
     "$url"
 }
 
-SECURE_URL="$URL"
-case "$URL" in
-  http://*) SECURE_URL="https://${URL#http://}" ;;
-  https://*) ;;
-  *)
-    echo "ERROR: Apple returned a URL with an unexpected scheme: $URL" >&2
-    exit 70
-    ;;
-esac
+# fetch tries TLS first and falls back to the scheme Apple gave us, which is
+# safe for anything the chunklist signature covers.
+fetch() {
 
-if ! download "$SECURE_URL"; then
-  rm -f -- "$OUTPUT" "$OUTPUT.aria2"
-  echo "ERROR: could not download the recovery image over TLS." >&2
-  echo "       Refusing to fall back to plain http: the result is baked into" >&2
-  echo "       the image and nothing downstream can verify it." >&2
+  local url="$1" dest="$2" token="$3" allow_plain="$4"
+  local secure="$url"
+
+  case "$url" in
+    http://*) secure="https://${url#http://}" ;;
+  esac
+
+  if [ "$secure" != "$url" ] && download "$secure" "$dest" "$token"; then
+    return 0
+  fi
+
+  rm -f -- "$dest" "$dest.aria2"
+
+  if [ "$allow_plain" != "Y" ]; then
+    echo "ERROR: could not download over TLS, and there is no signature to fall back on." >&2
+    return 1
+  fi
+
+  echo "Apple's CDN refused TLS; retrying over http (the chunklist signature covers this)."
+  download "$url" "$dest" "$token"
+}
+
+CHUNKLIST=""
+
+if [ -n "$CHUNK_URL" ] && [ -n "$CHUNK_TOKEN" ]; then
+
+  CHUNKLIST="${OUTPUT}.chunklist"
+  rm -f -- "$CHUNKLIST" "$CHUNKLIST.aria2"
+
+  if ! fetch "$CHUNK_URL" "$CHUNKLIST" "$CHUNK_TOKEN" "Y"; then
+    echo "ERROR: could not download the chunklist." >&2
+    exit 70
+  fi
+
+else
+
+  echo "WARNING: Apple did not return a chunklist for this image." >&2
+  echo "         Without it the download can only be trusted as far as TLS," >&2
+  echo "         so plain http will not be accepted." >&2
+
+fi
+
+ALLOW_PLAIN="N"
+[ -n "$CHUNKLIST" ] && ALLOW_PLAIN="Y"
+
+if ! fetch "$URL" "$OUTPUT" "$TOKEN" "$ALLOW_PLAIN"; then
+  rm -f -- "$OUTPUT" "$OUTPUT.aria2" "$CHUNKLIST"
+  echo "ERROR: could not download the recovery image." >&2
   exit 71
 fi
 
@@ -172,4 +214,13 @@ if [ "$(tail -c 512 "$OUTPUT" | head -c 4)" != "koly" ]; then
   exit 69
 fi
 
-echo "Recovery image verified: $(numfmt --to=iec --suffix=B "$SIZE"), UDIF trailer present."
+if [ -n "$CHUNKLIST" ]; then
+  if ! verify-recovery.py "$CHUNKLIST" "$OUTPUT"; then
+    rm -f -- "$OUTPUT" "$CHUNKLIST"
+    echo "ERROR: the recovery image does not match Apple's signed chunklist." >&2
+    exit 72
+  fi
+  rm -f -- "$CHUNKLIST"
+fi
+
+echo "Recovery image ready: $(numfmt --to=iec --suffix=B "$SIZE"), UDIF trailer present."

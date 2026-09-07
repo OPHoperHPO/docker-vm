@@ -4,12 +4,13 @@
 #
 # Two things are added to the upstream image:
 #
-#  1. The macOS recovery image is downloaded and verified at *build* time and
-#     shipped inside the image, so a fresh container boots straight into the
-#     macOS installer instead of spending the first several minutes downloading
-#     from Apple. This is the same pre-baked approach the Ubuntu and Windows
-#     images in this repository use, and /run/hooks.d/10-macos.sh stages it into
-#     /storage on the first run exactly like the Ubuntu image stages its qcow2.
+#  1. The macOS recovery image is downloaded at *build* time, checked against
+#     Apple's signed chunklist, and shipped inside the image, so a fresh
+#     container boots straight into the macOS installer instead of spending the
+#     first several minutes downloading from Apple. This is the same pre-baked
+#     approach the Ubuntu and Windows images in this repository use, and
+#     /run/hooks.d/10-macos.sh stages it into /storage on the first run exactly
+#     like the Ubuntu image stages its qcow2.
 #  2. The shared hooks: passt-by-default networking, the helper watchdog, and
 #     the vmguard access policy (see docs/network.md).
 #
@@ -45,7 +46,8 @@ FROM debian:trixie-slim AS recovery
 ARG MACOS_VERSION
 ARG BAKE_RECOVERY
 
-COPY --chmod=755 images/macos/fetch-recovery.sh /usr/local/bin/fetch-recovery.sh
+COPY --chmod=755 images/macos/fetch-recovery.sh   /usr/local/bin/fetch-recovery.sh
+COPY --chmod=755 images/macos/verify-recovery.py  /usr/local/bin/verify-recovery.py
 
 # The download tools are installed inside the conditional so that skipping the
 # bake costs nothing.
@@ -57,7 +59,7 @@ RUN set -eu; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        ca-certificates curl aria2 p7zip-full qemu-utils; \
+        ca-certificates curl aria2 p7zip-full qemu-utils python3-minimal; \
     rm -rf /var/lib/apt/lists/*; \
     if fetch-recovery.sh "${MACOS_VERSION}" /out/boot.dmg; then \
         exit 0; \
