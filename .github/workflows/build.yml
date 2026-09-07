@@ -48,6 +48,15 @@ on:
         required: false
         default: 'auto'
 
+# A branch with an open pull request fires both triggers, and rebuilding the
+# same commit twice costs a multi-gigabyte ISO download for nothing. Grouping
+# both events under the head branch collapses them, and a newer push supersedes
+# a run still in flight — except on the default branch, where a run may be
+# publishing and must be left alone.
+concurrency:
+  group: build-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != github.event.repository.default_branch }}
+
 env:
   REGISTRY: ghcr.io
   # GHCR requires lowercase. github.repository can be MixedCase.
