@@ -88,11 +88,17 @@ if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
   exit 66
 fi
 
-# Apple hands back a plain-http CDN URL. The image ends up baked into a
-# published container image and carries no signature we can check, so anyone on
-# the path could swap it — and the AssetToken would travel in the clear too.
-# The same CDN serves https, so upgrade the scheme and only fall back if Apple's
-# CDN genuinely refuses TLS.
+# Apple hands back a plain-http CDN URL. What it serves ends up baked into a
+# container image other people pull, and it carries no signature anyone can
+# check — the only tests below are that it is large, that qemu-img parses it and
+# that it ends in a UDIF trailer, all of which an attacker-supplied image passes.
+# Whoever sits on the path would therefore choose what macOS every user of that
+# image installs, and the AssetToken would travel in the clear on the way.
+#
+# The same CDN answers on 443, so the transfer is done over TLS and there is no
+# fallback: a build that cannot get the image securely must not produce one that
+# claims to have it. BAKE_RECOVERY=auto already degrades safely by skipping the
+# bake, which leaves the download to the user's own machine at first start.
 download() {
 
   local url="$1"
@@ -126,17 +132,19 @@ download() {
 SECURE_URL="$URL"
 case "$URL" in
   http://*) SECURE_URL="https://${URL#http://}" ;;
+  https://*) ;;
+  *)
+    echo "ERROR: Apple returned a URL with an unexpected scheme: $URL" >&2
+    exit 70
+    ;;
 esac
 
-if [ "$SECURE_URL" != "$URL" ]; then
-  if ! download "$SECURE_URL"; then
-    echo "WARNING: the CDN refused TLS; retrying over plain http." >&2
-    echo "WARNING: the recovery image is then unauthenticated in transit." >&2
-    rm -f -- "$OUTPUT" "$OUTPUT.aria2"
-    download "$URL"
-  fi
-else
-  download "$URL"
+if ! download "$SECURE_URL"; then
+  rm -f -- "$OUTPUT" "$OUTPUT.aria2"
+  echo "ERROR: could not download the recovery image over TLS." >&2
+  echo "       Refusing to fall back to plain http: the result is baked into" >&2
+  echo "       the image and nothing downstream can verify it." >&2
+  exit 71
 fi
 
 SIZE=$(stat -c%s "$OUTPUT")
