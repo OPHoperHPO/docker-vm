@@ -153,6 +153,12 @@ func (f *filter) inspect(p *packet, dir direction) verdict {
 		return verdict{act: actionAllow, reason: "non-ip"}
 	}
 
+	// Refused before anything else: a rule that constrains ports cannot decide a
+	// packet whose ports were deliberately left in a later fragment.
+	if p.truncatedFirstFragment() {
+		return verdict{act: actionDeny, reason: "truncated-fragment"}
+	}
+
 	if !f.cfg.Strict {
 		if r, ok := f.essential(p, dir); ok {
 			return verdict{act: actionAllow, reason: r}
@@ -198,44 +204,128 @@ func (f *filter) inspect(p *packet, dir direction) verdict {
 // port on the way in.
 func portOf(p *packet, _ direction) uint16 { return p.dstPort }
 
+// broadcastV4 is the limited broadcast address a DHCP client uses before it
+// has been given one of its own.
+var broadcastV4 = netip.AddrFrom4([4]byte{255, 255, 255, 255})
+
 // essential allows the handful of flows without which the guest cannot obtain
 // an address or resolve names. Disabled by NET_GUARD_STRICT=Y.
+//
+// Every field these exemptions look at is chosen by the guest, so each one is
+// pinned down to the exact exchange it is meant to permit. An exemption written
+// as "any packet on port 67 or 68" would be a way around the whole ACL: the
+// guest would only have to pick that source port to reach any destination.
 func (f *filter) essential(p *packet, dir direction) (string, bool) {
-	// DHCP / DHCPv6 to the passt-provided server.
+
 	if p.proto == protoUDP && p.hasPorts {
-		switch {
-		case p.dstPort == 67 || p.dstPort == 68 || p.srcPort == 67 || p.srcPort == 68:
+		if f.isDHCP(p, dir) {
 			return "dhcp", true
-		case p.dstPort == 546 || p.dstPort == 547:
+		}
+		if f.isDHCPv6(p, dir) {
 			return "dhcpv6", true
 		}
 	}
 
-	// DNS towards the gateway address passt hands out, plus the container's
-	// own resolvers when the guest was told to use them directly.
-	if (p.proto == protoUDP || p.proto == protoTCP) && p.hasPorts {
-		peer := p.dst
-		if dir == ingress {
-			peer = p.src
-		}
-		port := p.dstPort
-		if dir == ingress {
-			port = p.srcPort
-		}
-		if port == 53 && f.isResolver(peer) {
-			return "dns", true
-		}
+	if (p.proto == protoUDP || p.proto == protoTCP) && p.hasPorts && f.isDNS(p, dir) {
+		return "dns", true
 	}
 
-	// IPv6 neighbour discovery and multicast listener discovery.
-	if p.proto == protoICMPv6 && p.l4Off < len(p.frame) {
-		switch p.frame[p.l4Off] {
-		case 130, 131, 132, 133, 134, 135, 136, 143:
-			return "ndp", true
-		}
+	if p.proto == protoICMPv6 && f.isNDP(p, dir) {
+		return "ndp", true
 	}
 
 	return "", false
+}
+
+// isDHCP matches the DHCPv4 exchange with the server passt provides: the client
+// sends from 68 to 67, the server answers from 67 to 68, and the peer is either
+// the broadcast address or the gateway.
+func (f *filter) isDHCP(p *packet, dir direction) bool {
+
+	if !p.src.Is4() || !p.dst.Is4() {
+		return false
+	}
+
+	if dir == egress {
+		return p.srcPort == 68 && p.dstPort == 67 && f.isDHCPPeer(p.dst)
+	}
+	return p.srcPort == 67 && p.dstPort == 68 && f.isDHCPPeer(p.src)
+}
+
+// isDHCPPeer accepts the addresses a DHCPv4 conversation legitimately uses: the
+// limited broadcast and the unspecified address before the lease exists, and
+// the gateway once the client renews its lease by unicast.
+func (f *filter) isDHCPPeer(a netip.Addr) bool {
+
+	if !a.IsValid() {
+		return false
+	}
+	if a == broadcastV4 || a.IsUnspecified() {
+		return true
+	}
+	return f.cfg.Gateway.IsValid() && a == f.cfg.Gateway
+}
+
+// isDHCPv6 matches the DHCPv6 exchange, which runs between 546 and 547 and
+// never leaves the link.
+func (f *filter) isDHCPv6(p *packet, dir direction) bool {
+
+	if !p.src.Is6() || !p.dst.Is6() {
+		return false
+	}
+
+	if dir == egress {
+		return p.srcPort == 546 && p.dstPort == 547 && f.isOnLink(p.dst)
+	}
+	return p.srcPort == 547 && p.dstPort == 546 && f.isOnLink(p.src)
+}
+
+// isNDP matches neighbour discovery and multicast listener discovery. Both are
+// link-local by definition, so the same message type addressed to a routable
+// address is ordinary traffic and gets no exemption.
+func (f *filter) isNDP(p *packet, dir direction) bool {
+
+	if p.l4Off <= 0 || p.l4Off >= len(p.frame) {
+		return false
+	}
+
+	switch p.frame[p.l4Off] {
+	case 130, 131, 132, 133, 134, 135, 136, 143:
+	default:
+		return false
+	}
+
+	peer := p.dst
+	if dir == ingress {
+		peer = p.src
+	}
+	return f.isOnLink(peer)
+}
+
+// isOnLink accepts the addresses link-local protocols may use: an IPv6
+// multicast group, a link-local address, the unspecified address during
+// duplicate address detection, or the gateway itself.
+func (f *filter) isOnLink(a netip.Addr) bool {
+
+	if !a.IsValid() || !a.Is6() {
+		return false
+	}
+	if a.IsMulticast() || a.IsLinkLocalUnicast() || a.IsUnspecified() {
+		return true
+	}
+	return f.cfg.Gateway.IsValid() && a == f.cfg.Gateway
+}
+
+// isDNS matches name resolution towards the address passt hands out as the
+// resolver, plus the container's own nameservers when the guest was pointed at
+// them directly. Any other destination on port 53 is ordinary traffic.
+func (f *filter) isDNS(p *packet, dir direction) bool {
+
+	peer, port := p.dst, p.dstPort
+	if dir == ingress {
+		peer, port = p.src, p.srcPort
+	}
+	return port == 53 && f.isResolver(peer)
 }
 
 func (f *filter) isResolver(a netip.Addr) bool {

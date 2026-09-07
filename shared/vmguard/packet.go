@@ -43,6 +43,7 @@ type packet struct {
 	srcPort   uint16
 	dstPort   uint16
 	fragment  bool // non-first fragment: ports are not available
+	moreFrags bool // this datagram continues in a later fragment
 	tcpFlags  uint8
 	tcpSeq    uint32
 	tcpAck    uint32
@@ -116,8 +117,9 @@ func (p *packet) decodeIPv4() {
 		total = len(b)
 	}
 
-	fragOff := binary.BigEndian.Uint16(b[6:8]) & 0x1fff
-	if fragOff != 0 {
+	flagsFrag := binary.BigEndian.Uint16(b[6:8])
+	p.moreFrags = flagsFrag&0x2000 != 0
+	if flagsFrag&0x1fff != 0 {
 		p.fragment = true
 		return
 	}
@@ -170,10 +172,11 @@ func (p *packet) decodeIPv6() {
 			if off+8 > len(b) {
 				return
 			}
-			fragOff := binary.BigEndian.Uint16(b[off+2:off+4]) &^ 0x0007
+			fragField := binary.BigEndian.Uint16(b[off+2 : off+4])
+			p.moreFrags = fragField&0x0001 != 0
 			next = b[off]
 			off += 8
-			if fragOff != 0 {
+			if fragField&^0x0007 != 0 {
 				p.proto = next
 				p.fragment = true
 				return
@@ -228,6 +231,23 @@ func (p *packet) decodeTransport(l4Len int) {
 		p.srcPort = binary.BigEndian.Uint16(b[0:2])
 		p.dstPort = binary.BigEndian.Uint16(b[2:4])
 	}
+}
+
+// truncatedFirstFragment reports a first fragment that does not carry its own
+// transport header.
+//
+// The smallest IPv4 path MTU leaves room for far more than a TCP or UDP header,
+// so no real stack emits one; it is a long-standing way to hide the port a
+// firewall rule matches on and let the receiver reassemble the real one.
+func (p *packet) truncatedFirstFragment() bool {
+	if !p.ip || !p.moreFrags || p.fragment {
+		return false
+	}
+	switch p.proto {
+	case protoTCP, protoUDP:
+		return !p.hasPorts
+	}
+	return false
 }
 
 // protoName renders the IP protocol for rules and log lines.

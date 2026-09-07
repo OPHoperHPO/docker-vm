@@ -29,6 +29,8 @@ type frameOpts struct {
 	tcpSeq, tcpAck   uint32
 	vlan             bool
 	fragOffset       uint16 // IPv4 fragment offset in 8-byte units
+	moreFragments    bool   // set the IPv4 MF flag
+	truncateL4       int    // keep only this many bytes of the transport header
 	v6ExtHeaders     []byte // raw extension header chain for IPv6
 	v6ExtNext        uint8  // first next-header value when v6ExtHeaders is set
 }
@@ -53,10 +55,18 @@ func buildFrame(t *testing.T, o frameOpts) []byte {
 		}
 		eth = binary.BigEndian.AppendUint16(eth, ethTypeIPv4)
 
+		if o.truncateL4 > 0 && o.truncateL4 < len(l4) {
+			l4 = l4[:o.truncateL4]
+		}
+
 		hdr := make([]byte, 20)
 		hdr[0] = 0x45
 		binary.BigEndian.PutUint16(hdr[2:4], uint16(20+len(l4)))
-		binary.BigEndian.PutUint16(hdr[6:8], o.fragOffset&0x1fff)
+		flags := o.fragOffset & 0x1fff
+		if o.moreFragments {
+			flags |= 0x2000
+		}
+		binary.BigEndian.PutUint16(hdr[6:8], flags)
 		hdr[8] = 64
 		hdr[9] = o.proto
 		copy(hdr[12:16], src.AsSlice())

@@ -128,3 +128,39 @@ func TestDecodeRejectsShortIHL(t *testing.T) {
 		t.Fatal("frame with an undersized IHL was accepted")
 	}
 }
+
+func TestTruncatedFirstFragmentIsFlagged(t *testing.T) {
+	// A first fragment carrying only 8 of the 20 TCP header bytes: enough to
+	// reassemble at the far end, not enough for a port rule to see the port.
+	frame := buildFrame(t, frameOpts{
+		src: "20.20.20.21", dst: "8.8.8.8", proto: protoTCP,
+		srcPort: 45000, dstPort: 443, tcpFlags: tcpFlagSYN,
+		moreFragments: true, truncateL4: 8,
+	})
+
+	p := decode(frame)
+	if p.hasPorts {
+		t.Fatal("ports were read from an incomplete TCP header")
+	}
+	if !p.moreFrags || p.fragment {
+		t.Fatalf("moreFrags=%v fragment=%v, want a first fragment", p.moreFrags, p.fragment)
+	}
+	if !p.truncatedFirstFragment() {
+		t.Fatal("the truncated first fragment was not recognised")
+	}
+
+	// A complete first fragment of a genuinely fragmented datagram is normal.
+	whole := buildFrame(t, frameOpts{
+		src: "20.20.20.21", dst: "8.8.8.8", proto: protoTCP,
+		srcPort: 45000, dstPort: 443, tcpFlags: tcpFlagSYN,
+		moreFragments: true,
+	})
+	if decode(whole).truncatedFirstFragment() {
+		t.Error("a complete first fragment was treated as truncated")
+	}
+
+	// An unfragmented packet must never be flagged.
+	if decode(tcpSyn(t, "20.20.20.21", "8.8.8.8", 443)).truncatedFirstFragment() {
+		t.Error("an unfragmented packet was treated as a truncated fragment")
+	}
+}

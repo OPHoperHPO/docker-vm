@@ -251,3 +251,116 @@ func TestReloadKeepsPolicyWhenFileIsInvalid(t *testing.T) {
 		t.Fatal("an unparsable rules file relaxed the running policy")
 	}
 }
+
+// The DHCP allowance must not become a way around the ACL. Every field below
+// is chosen by the guest, so anything the exemption does not pin down is a
+// destination the guest can reach regardless of the policy.
+func TestDHCPAllowanceCannotBeUsedToReachDeniedHosts(t *testing.T) {
+	cfg := testConfig(t)
+	f := buildFilter(t, cfg, map[string]string{"NET_PRESET": "isolated"})
+
+	cases := []struct {
+		name             string
+		dst              string
+		srcPort, dstPort uint16
+		want             action
+	}{
+		{"real discover to the broadcast address", "255.255.255.255", 68, 67, actionAllow},
+		{"real request to the gateway", "20.20.20.1", 68, 67, actionAllow},
+
+		{"client port, arbitrary host and port", "10.1.2.3", 68, 5432, actionDeny},
+		{"server port as source, arbitrary host", "10.1.2.3", 67, 5432, actionDeny},
+		{"dhcp port pair to an unrelated host", "93.184.216.34", 68, 67, actionDeny},
+		{"server port as destination on a third party", "10.1.2.3", 45000, 67, actionDeny},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			frame := buildFrame(t, frameOpts{
+				src: "20.20.20.21", dst: tc.dst, proto: protoUDP,
+				srcPort: tc.srcPort, dstPort: tc.dstPort, payload: []byte("x"),
+			})
+			if v := f.inspect(decode(frame), egress); v.act != tc.want {
+				t.Errorf("udp %s:%d -> %s:%d = %s (%s), want %s",
+					"20.20.20.21", tc.srcPort, tc.dst, tc.dstPort, v.act, v.reason, tc.want)
+			}
+		})
+	}
+}
+
+func TestDHCPv6AllowanceIsScoped(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Gateway = mustAddr(t, "fd00::1")
+	f := buildFilter(t, cfg, map[string]string{"NET_PRESET": "isolated"})
+
+	mk := func(dst string, sp, dp uint16) *packet {
+		return decode(buildFrame(t, frameOpts{
+			src: "fd00::21", dst: dst, proto: protoUDP,
+			srcPort: sp, dstPort: dp, payload: []byte("x"),
+		}))
+	}
+
+	if v := f.inspect(mk("ff02::1:2", 546, 547), egress); v.act != actionAllow {
+		t.Errorf("real DHCPv6 solicit was denied (%s)", v.reason)
+	}
+	if v := f.inspect(mk("2001:db8::1", 546, 5432), egress); v.act != actionDeny {
+		t.Errorf("DHCPv6 client port reached an arbitrary host and port (%s)", v.reason)
+	}
+	if v := f.inspect(mk("2001:db8::1", 546, 547), egress); v.act != actionDeny {
+		t.Errorf("DHCPv6 port pair reached an off-link host (%s)", v.reason)
+	}
+}
+
+// Neighbour discovery is link-local by definition; the exemption must not carry
+// ICMPv6 to arbitrary routable addresses.
+func TestNDPAllowanceIsLinkLocal(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Gateway = mustAddr(t, "fd00::1")
+	f := buildFilter(t, cfg, map[string]string{"NET_PRESET": "isolated"})
+
+	onLink := buildFrame(t, frameOpts{
+		src: "fd00::21", dst: "ff02::1:ff00:1", proto: protoICMPv6, payload: []byte{135},
+	})
+	if v := f.inspect(decode(onLink), egress); v.act != actionAllow {
+		t.Errorf("neighbour solicitation to a solicited-node multicast address was denied (%s)", v.reason)
+	}
+
+	offLink := buildFrame(t, frameOpts{
+		src: "fd00::21", dst: "2001:db8::1", proto: protoICMPv6, payload: []byte{135},
+	})
+	if v := f.inspect(decode(offLink), egress); v.act != actionDeny {
+		t.Errorf("an NDP-typed packet reached a routable address (%s)", v.reason)
+	}
+}
+
+// A port-constrained rule cannot judge a packet whose ports were left out of
+// the first fragment, so the packet must not slip through on the default.
+func TestTruncatedFirstFragmentIsDenied(t *testing.T) {
+	cfg := testConfig(t)
+	f := buildFilter(t, cfg, map[string]string{"NET_DENY": "tcp:*:22"})
+
+	// The same destination and port, hidden behind a first fragment that stops
+	// before the port field.
+	hidden := buildFrame(t, frameOpts{
+		src: "20.20.20.21", dst: "203.0.113.9", proto: protoTCP,
+		srcPort: 45000, dstPort: 22, tcpFlags: tcpFlagSYN,
+		moreFragments: true, truncateL4: 8,
+	})
+	v := f.inspect(decode(hidden), egress)
+	if v.act != actionDeny {
+		t.Fatalf("a truncated first fragment was allowed (%s) past a port rule", v.reason)
+	}
+	if v.reason != "truncated-fragment" {
+		t.Errorf("reason = %q, want truncated-fragment", v.reason)
+	}
+
+	// Ordinary fragmented traffic still flows.
+	ok := buildFrame(t, frameOpts{
+		src: "20.20.20.21", dst: "203.0.113.9", proto: protoUDP,
+		srcPort: 45000, dstPort: 4433, payload: make([]byte, 64),
+		moreFragments: true,
+	})
+	if v := f.inspect(decode(ok), egress); v.act != actionAllow {
+		t.Errorf("a normal fragmented datagram was denied (%s)", v.reason)
+	}
+}
