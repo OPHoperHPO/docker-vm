@@ -151,6 +151,17 @@ startWatchdog() {
   return 0
 }
 
+# A passt that fails to start is invisible from the outside: the base image
+# falls back to slirp, the VM boots, and only the forwarded ports and the
+# missing policy socket differ. Say it out loud even when no rules were asked
+# for, so the next person does not debug a working-looking VM.
+guardRequested="${VM_NETWORK_REQUESTED:-}"
+if [[ "${guardRequested,,}" == "passt" && "${NETWORK,,}" == "slirp" ]]; then
+  warn "passt was requested but did not start; the container fell back to slirp."
+  warn "Forwarded ports and throughput differ, and access rules cannot be enforced."
+  warn "passt's own reason is in the lines above."
+fi
+
 if guardWanted; then
 
   if disabled "$NETWORK"; then
