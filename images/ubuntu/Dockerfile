@@ -68,7 +68,7 @@ RUN xorriso -as mkisofs \
 ############################################################
 # Stage 3: final image on top of qemux/qemu
 ############################################################
-FROM qemux/qemu:latest@sha256:67e6693f2b911bc504a546ef1b79dca1c6a6b763cf5760a201c9051d967ac1e3
+FROM qemux/qemu:latest@sha256:e7f6fda52503a546fd649670ba46e4bc23dc6dcef275bc3fac48877fbbc430df
 
 # Default boot artifacts
 COPY --from=prep /work/boot.qcow2 /opt/baked/boot.qcow2
