@@ -223,7 +223,7 @@ jobs:
       - name: Extract metadata
         if: steps.gate.outputs.run == 'true'
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ steps.img.outputs.image }}
           tags: |
