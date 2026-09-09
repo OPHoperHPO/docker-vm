@@ -16,7 +16,7 @@
 set -Eeuo pipefail
 
 : "${STORAGE:=/storage}"
-: "${VERSION:=26}"
+: "${VERSION:=15}"
 
 _MACOS_BAKED="/opt/baked/base.dmg"
 
